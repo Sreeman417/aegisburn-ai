@@ -1,27 +1,25 @@
-/* =========================================================
-   AEGISBURN AI
-   COMPLETE MATCHING FRONTEND SCRIPT
+"use strict";
 
-   File:
-   backend/static/app.js
-   ========================================================= */
-
-
-/* =========================================================
-   CONFIG
-   ========================================================= */
+/* ============================================================
+   AEGISBURN AI — FRONTEND APPLICATION
+   ============================================================ */
 
 const API_BASE = window.location.origin;
 
+const state = {
+    components: [],
+    selectedComponentId: null,
+    selectedResult: null
+};
 
-/* =========================================================
+
+/* ============================================================
    DOM HELPERS
-   ========================================================= */
+   ============================================================ */
 
 function $(id) {
     return document.getElementById(id);
 }
-
 
 function setText(id, value) {
     const element = $(id);
@@ -30,87 +28,51 @@ function setText(id, value) {
         return;
     }
 
-    if (
-        value === undefined ||
-        value === null ||
-        value === ""
-    ) {
-        element.textContent = "—";
+    element.textContent =
+        value === undefined || value === null
+            ? ""
+            : String(value);
+}
+
+function setHTML(id, value) {
+    const element = $(id);
+
+    if (!element) {
         return;
     }
 
-    element.textContent = value;
+    element.innerHTML = value;
 }
 
-
-function numberValue(value, fallback = 0) {
-    const n = Number(value);
-
-    return Number.isFinite(n)
-        ? n
-        : fallback;
-}
-
-
-function formatNumber(value, decimals = 3) {
-    if (
-        value === undefined ||
-        value === null ||
-        value === ""
-    ) {
-        return "—";
-    }
-
+function formatNumber(value, decimals = 2) {
     const number = Number(value);
 
     if (!Number.isFinite(number)) {
         return "—";
     }
 
-    return number.toFixed(decimals);
+    return number.toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+    });
 }
 
-
-function formatInteger(value) {
-    if (
-        value === undefined ||
-        value === null ||
-        value === ""
-    ) {
-        return "—";
-    }
-
+function formatValue(value, unit = "") {
     const number = Number(value);
 
     if (!Number.isFinite(number)) {
         return "—";
     }
 
-    return Math.round(number).toLocaleString();
+    return `${formatNumber(number)}${unit ? ` ${unit}` : ""}`;
 }
 
-
-function formatPercent(value, decimals = 1) {
-    if (
-        value === undefined ||
-        value === null ||
-        value === ""
-    ) {
-        return "—";
+function escapeHTML(value) {
+    if (value === undefined || value === null) {
+        return "";
     }
 
-    const number = Number(value);
-
-    if (!Number.isFinite(number)) {
-        return "—";
-    }
-
-    return `${number.toFixed(decimals)}%`;
-}
-
-
-function escapeHtml(value) {
-    return String(value ?? "")
+    return String(value)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
@@ -119,131 +81,181 @@ function escapeHtml(value) {
 }
 
 
-/* =========================================================
-   CONNECTION STATUS
-   ========================================================= */
+/* ============================================================
+   RISK HELPERS
+   ============================================================ */
 
-function setConnectionStatus(status, message) {
-    const element = $("connectionStatus");
-
-    if (!element) {
-        return;
+function normalizeRisk(value) {
+    if (!value) {
+        return "REVIEW";
     }
 
-    element.className = "system-status";
-
-    const normalized = String(status || "")
-        .toLowerCase()
-        .trim();
+    const risk = String(value).toUpperCase();
 
     if (
-        normalized === "online" ||
-        normalized === "healthy" ||
-        normalized === "connected"
+        risk.includes("HIGH") ||
+        risk.includes("CRITICAL")
     ) {
-        element.classList.add("online");
-    } else if (
-        normalized === "offline" ||
-        normalized === "error" ||
-        normalized === "failed"
-    ) {
-        element.classList.add("offline");
-    } else {
-        element.classList.add("connecting");
+        return "HIGH RISK";
     }
 
-    element.textContent =
-        message ||
-        (
-            normalized === "online" ||
-            normalized === "healthy" ||
-            normalized === "connected"
-                ? "System Online"
-                : normalized === "offline" ||
-                  normalized === "error" ||
-                  normalized === "failed"
-                    ? "Connection Failed"
-                    : "Connecting..."
-        );
+    if (
+        risk.includes("NORMAL") ||
+        risk.includes("LOW") ||
+        risk.includes("SAFE")
+    ) {
+        return "NORMAL";
+    }
+
+    return "REVIEW";
+}
+
+function riskClass(risk) {
+    const normalized = normalizeRisk(risk);
+
+    if (normalized === "HIGH RISK") {
+        return "high-risk";
+    }
+
+    if (normalized === "NORMAL") {
+        return "normal";
+    }
+
+    return "review";
 }
 
 
-/* =========================================================
-   API HELPER
-   ========================================================= */
+/* ============================================================
+   API REQUEST
+   ============================================================ */
 
 async function apiRequest(path, options = {}) {
-    const url = `${API_BASE}${path}`;
-
-    const response = await fetch(url, {
+    const requestOptions = {
         method: options.method || "GET",
         headers: {
-            "Content-Type": "application/json",
             ...(options.headers || {})
-        },
-        body: options.body
-            ? JSON.stringify(options.body)
-            : undefined
-    });
+        }
+    };
 
-    let data = null;
+    if (options.body !== undefined) {
+        requestOptions.headers["Content-Type"] =
+            "application/json";
 
-    try {
+        requestOptions.body =
+            JSON.stringify(options.body);
+    }
+
+    const response = await fetch(
+        `${API_BASE}${path}`,
+        requestOptions
+    );
+
+    const contentType =
+        response.headers.get("content-type") || "";
+
+    let data;
+
+    if (contentType.includes("application/json")) {
         data = await response.json();
-    } catch (error) {
-        data = null;
+    } else {
+        const text = await response.text();
+
+        try {
+            data = JSON.parse(text);
+        } catch {
+            data = {
+                detail: text
+            };
+        }
     }
 
     if (!response.ok) {
-        let message = `Request failed (${response.status})`;
+        const message =
+            data?.detail ||
+            data?.message ||
+            `Request failed with status ${response.status}`;
 
-        if (data) {
-            if (typeof data.detail === "string") {
-                message = data.detail;
-            } else if (typeof data.message === "string") {
-                message = data.message;
-            } else if (typeof data.error === "string") {
-                message = data.error;
-            }
-        }
-
-        throw new Error(message);
+        throw new Error(
+            typeof message === "string"
+                ? message
+                : JSON.stringify(message)
+        );
     }
 
     return data;
 }
 
 
-/* =========================================================
-   HEALTH CHECK
-   ========================================================= */
+/* ============================================================
+   CONNECTION STATUS
+   ============================================================ */
 
-async function checkHealth() {
-    setConnectionStatus(
-        "connecting",
-        "Connecting..."
+function getConnectionElement() {
+    return (
+        $("connectionText") ||
+        $("connectionStatus") ||
+        $("systemStatus")
     );
+}
 
+function getConnectionDot() {
+    return $("connectionDot") || $("statusDot");
+}
+
+function setConnectionState(
+    stateName,
+    text
+) {
+    const textElement =
+        getConnectionElement();
+
+    const dotElement =
+        getConnectionDot();
+
+    if (textElement) {
+        textElement.textContent = text;
+
+        textElement.classList.remove(
+            "online",
+            "offline",
+            "connecting"
+        );
+
+        textElement.classList.add(
+            stateName
+        );
+    }
+
+    if (dotElement) {
+        dotElement.classList.remove(
+            "online",
+            "offline",
+            "connecting"
+        );
+
+        dotElement.classList.add(
+            stateName
+        );
+    }
+}
+
+async function checkConnection() {
     try {
-        const data = await apiRequest("/health");
-
-        const status = String(
-            data?.status || "healthy"
-        ).toLowerCase();
+        const health =
+            await apiRequest("/health");
 
         if (
-            status === "healthy" ||
-            status === "running" ||
-            status === "ok"
+            health &&
+            health.status === "healthy"
         ) {
-            setConnectionStatus(
+            setConnectionState(
                 "online",
                 "System Online"
             );
         } else {
-            setConnectionStatus(
+            setConnectionState(
                 "online",
-                "Backend Connected"
+                "System Ready"
             );
         }
 
@@ -251,11 +263,11 @@ async function checkHealth() {
 
     } catch (error) {
         console.error(
-            "Health check failed:",
+            "Backend connection failed:",
             error
         );
 
-        setConnectionStatus(
+        setConnectionState(
             "offline",
             "Backend Offline"
         );
@@ -265,12 +277,11 @@ async function checkHealth() {
 }
 
 
-/* =========================================================
-   NORMALIZE COMPONENT LIST
-   ========================================================= */
+/* ============================================================
+   RESPONSE NORMALIZATION
+   ============================================================ */
 
-function normalizeComponents(data) {
-
+function extractComponents(data) {
     if (Array.isArray(data)) {
         return data;
     }
@@ -290,439 +301,434 @@ function normalizeComponents(data) {
     return [];
 }
 
-
-/* =========================================================
-   GET COMPONENT ID
-   ========================================================= */
-
-function getComponentId(component) {
-    if (
-        typeof component === "string" ||
-        typeof component === "number"
-    ) {
-        return String(component);
-    }
-
-    if (!component) {
-        return "";
-    }
-
-    return String(
-        component.component_id ??
-        component.id ??
-        component.componentId ??
-        ""
-    );
-}
-
-
-/* =========================================================
-   COMPONENT LABEL
-   ========================================================= */
-
-function getComponentLabel(component) {
-
-    if (
-        typeof component === "string" ||
-        typeof component === "number"
-    ) {
-        return String(component);
-    }
-
-    if (!component) {
-        return "Unknown Component";
-    }
-
-    const id = getComponentId(component);
-
-    const type =
-        component.component_type ??
-        component.type ??
-        "";
-
-    const parameter =
-        component.parameter_name ??
-        component.parameter ??
-        "";
-
-    const parts = [
-        id,
-        type,
-        parameter
-    ].filter(Boolean);
-
-    return parts.length > 0
-        ? parts.join(" — ")
-        : "Unknown Component";
-}
-
-
-/* =========================================================
-   LOAD COMPONENTS
-   ========================================================= */
-
-async function loadComponents() {
-
-    const select = $("componentSelect");
-
-    if (!select) {
-        console.error(
-            "componentSelect element not found."
-        );
-        return [];
-    }
-
-    select.disabled = true;
-
-    select.innerHTML = `
-        <option value="">
-            Loading components...
-        </option>
-    `;
-
-    try {
-        const data = await apiRequest("/components");
-
-        const components =
-            normalizeComponents(data);
-
-        select.innerHTML = `
-            <option value="">
-                Select a component...
-            </option>
-        `;
-
-        if (components.length === 0) {
-
-            select.innerHTML = `
-                <option value="">
-                    No components found
-                </option>
-            `;
-
-            setText(
-                "componentStatus",
-                "No components were returned by the backend."
-            );
-
-            return [];
-        }
-
-        components.forEach((component) => {
-
-            const id =
-                getComponentId(component);
-
-            if (!id) {
-                return;
-            }
-
-            const option =
-                document.createElement("option");
-
-            option.value = id;
-
-            option.textContent =
-                getComponentLabel(component);
-
-            select.appendChild(option);
-        });
-
-        select.disabled = false;
-
-        setText(
-            "componentStatus",
-            `${components.length.toLocaleString()} components available for screening.`
-        );
-
-        return components;
-
-    } catch (error) {
-
-        console.error(
-            "Failed to load components:",
-            error
-        );
-
-        select.innerHTML = `
-            <option value="">
-                Failed to load components
-            </option>
-        `;
-
-        setText(
-            "componentStatus",
-            `Failed to load components: ${error.message}`
-        );
-
-        return [];
-    }
-}
-
-
-/* =========================================================
-   SUMMARY COUNTS
-   ========================================================= */
-
-function normalizeRisk(value) {
-    return String(value || "")
-        .trim()
-        .toUpperCase()
-        .replace(/[_-]/g, " ");
-}
-
-
-function extractSummaryCounts(data) {
-
-    const source =
-        data?.summary ||
-        data?.counts ||
-        data ||
-        {};
-
-    const normal =
-        source.normal ??
-        source.NORMAL ??
-        source.normal_count ??
-        source.normalCount;
-
-    const review =
-        source.review ??
-        source.REVIEW ??
-        source.review_count ??
-        source.reviewCount;
-
-    const high =
-        source.high_risk ??
-        source.highRisk ??
-        source.high ??
-        source.HIGH_RISK ??
-        source.high_risk_count ??
-        source.highRiskCount;
-
-    const total =
-        source.total ??
-        source.TOTAL ??
-        source.total_count ??
-        source.totalCount;
-
-    return {
-        normal,
-        review,
-        high,
-        total
-    };
-}
-
-
-async function loadSummaryCounts(components) {
-
-    let normal = 0;
-    let review = 0;
-    let high = 0;
-
-    if (!Array.isArray(components)) {
-        components = [];
-    }
-
-    /*
-       First try metadata endpoint.
-
-       If the backend metadata does not contain summary
-       information, use the component count and leave
-       risk buckets as unavailable instead of crashing.
-    */
-
-    try {
-
-        const metadata =
-            await apiRequest("/metadata");
-
-        const counts =
-            extractSummaryCounts(metadata);
-
-        if (counts.normal !== undefined) {
-            normal =
-                numberValue(counts.normal);
-        }
-
-        if (counts.review !== undefined) {
-            review =
-                numberValue(counts.review);
-        }
-
-        if (counts.high !== undefined) {
-            high =
-                numberValue(counts.high);
-        }
-
-        setText(
-            "normalCount",
-            counts.normal !== undefined
-                ? formatInteger(normal)
-                : "—"
-        );
-
-        setText(
-            "reviewCount",
-            counts.review !== undefined
-                ? formatInteger(review)
-                : "—"
-        );
-
-        setText(
-            "highRiskCount",
-            counts.high !== undefined
-                ? formatInteger(high)
-                : "—"
-        );
-
-        setText(
-            "totalCount",
-            counts.total !== undefined
-                ? formatInteger(counts.total)
-                : formatInteger(components.length)
-        );
-
-        return;
-
-    } catch (error) {
-
-        console.warn(
-            "Metadata summary unavailable:",
-            error
-        );
-    }
-
-    /*
-       Fallback.
-    */
-
-    setText(
-        "normalCount",
-        "—"
-    );
-
-    setText(
-        "reviewCount",
-        "—"
-    );
-
-    setText(
-        "highRiskCount",
-        "—"
-    );
-
-    setText(
-        "totalCount",
-        formatInteger(components.length)
-    );
-}
-
-
-/* =========================================================
-   ANALYZE COMPONENT
-   ========================================================= */
-
-async function analyzeComponent(componentId) {
-
-    if (!componentId) {
-        return null;
-    }
-
-    /*
-       Backend route may expect:
-       POST /analyze
-       {
-           "component_id": "CMP-000001"
-       }
-    */
-
-    return await apiRequest(
-        "/analyze",
-        {
-            method: "POST",
-
-            body: {
-                component_id: componentId
-            }
-        }
-    );
-}
-
-
-/* =========================================================
-   NORMALIZE ANALYSIS RESPONSE
-   ========================================================= */
-
-function normalizeAnalysis(data) {
-
+function extractAnalysis(data) {
     if (!data) {
         return {};
     }
 
-    /*
-       Supports either:
-
-       {
-           component_id: ...
-           risk_score: ...
-       }
-
-       or:
-
-       {
-           result: {
-               ...
-           }
-       }
-
-       or:
-
-       {
-           analysis: {
-               ...
-           }
-       }
-    */
-
-    if (
-        data.result &&
-        typeof data.result === "object"
-    ) {
-        return {
-            ...data,
-            ...data.result
-        };
+    if (data.result) {
+        return data.result;
     }
 
-    if (
-        data.analysis &&
-        typeof data.analysis === "object"
-    ) {
-        return {
-            ...data,
-            ...data.analysis
-        };
+    if (data.analysis) {
+        return data.analysis;
+    }
+
+    if (data.data) {
+        return data.data;
     }
 
     return data;
 }
 
 
-/* =========================================================
-   OVERVIEW TABLE
-   ========================================================= */
+/* ============================================================
+   LOAD COMPONENTS
+   ============================================================ */
 
-function updateOverview(data) {
+async function loadComponents() {
+    const response =
+        await apiRequest("/components");
 
-    const body =
-        $("overviewBody");
+    const components =
+        extractComponents(response);
 
-    if (!body) {
+    state.components = components;
+
+    populateComponentSelector(
+        components
+    );
+
+    return components;
+}
+
+function getComponentId(component) {
+    return (
+        component?.component_id ??
+        component?.id ??
+        component?.ComponentID ??
+        ""
+    );
+}
+
+function getComponentType(component) {
+    return (
+        component?.component_type ??
+        component?.type ??
+        ""
+    );
+}
+
+function getParameterName(component) {
+    return (
+        component?.parameter_name ??
+        component?.parameter ??
+        ""
+    );
+}
+
+function populateComponentSelector(
+    components
+) {
+    const select =
+        $("componentSelect") ||
+        $("component-selector");
+
+    if (!select) {
+        console.warn(
+            "Component selector not found."
+        );
+
         return;
     }
 
+    select.innerHTML = "";
+
+    if (!components.length) {
+        const option =
+            document.createElement("option");
+
+        option.value = "";
+        option.textContent =
+            "No components available";
+
+        select.appendChild(option);
+
+        return;
+    }
+
+    components.forEach(
+        (component) => {
+            const option =
+                document.createElement(
+                    "option"
+                );
+
+            const componentId =
+                getComponentId(component);
+
+            const componentType =
+                getComponentType(component);
+
+            const parameter =
+                getParameterName(component);
+
+            option.value = componentId;
+
+            option.textContent =
+                `${componentId} — ${componentType} — ${parameter}`;
+
+            select.appendChild(option);
+        }
+    );
+
+    if (
+        state.selectedComponentId &&
+        components.some(
+            (component) =>
+                String(
+                    getComponentId(component)
+                ) ===
+                String(
+                    state.selectedComponentId
+                )
+        )
+    ) {
+        select.value =
+            state.selectedComponentId;
+    } else {
+        state.selectedComponentId =
+            select.value;
+    }
+}
+
+
+/* ============================================================
+   COMPONENT LOOKUP
+   ============================================================ */
+
+function findComponent(componentId) {
+    return state.components.find(
+        (component) =>
+            String(
+                getComponentId(component)
+            ) ===
+            String(componentId)
+    );
+}
+
+
+/* ============================================================
+   ENGINEERING LIMITS
+   ============================================================ */
+
+const ENGINEERING_LIMITS = {
+    "Logic IC": {
+        "Iddq": 50
+    },
+
+    "Memory IC": {
+        "Standby Current": 80
+    },
+
+    "ADC": {
+        "Leakage Current": 25
+    },
+
+    "Driver IC": {
+        "Propagation Delay": 40
+    }
+};
+
+function getEngineeringLimit(data) {
+    const explicitLimit =
+        Number(
+            data?.engineering_limit
+        );
+
+    if (
+        Number.isFinite(
+            explicitLimit
+        ) &&
+        explicitLimit > 0
+    ) {
+        return explicitLimit;
+    }
+
+    const componentType =
+        data?.component_type ||
+        data?.type ||
+        "";
+
+    const parameter =
+        data?.parameter_name ||
+        data?.parameter ||
+        "";
+
+    return (
+        ENGINEERING_LIMITS[
+            componentType
+        ]?.[parameter] ??
+        null
+    );
+}
+
+function calculateLimitUtilization(data) {
+    const limit =
+        getEngineeringLimit(data);
+
+    if (
+        !Number.isFinite(limit) ||
+        limit <= 0
+    ) {
+        return null;
+    }
+
+    const currentValue =
+        Number(
+            data?.value_168h ??
+            data?.value_96h ??
+            data?.value_24h ??
+            data?.value_0h
+        );
+
+    if (
+        !Number.isFinite(currentValue)
+    ) {
+        return null;
+    }
+
+    return (
+        currentValue /
+        limit *
+        100
+    );
+}
+
+
+/* ============================================================
+   LOAD AND ANALYZE SINGLE COMPONENT
+   ============================================================ */
+
+async function loadComponent(
+    componentId
+) {
+    if (!componentId) {
+        return;
+    }
+
+    state.selectedComponentId =
+        componentId;
+
+    setText(
+        "componentStatus",
+        `${componentId} screening in progress...`
+    );
+
+    try {
+        /*
+         * Use the analysis endpoint first.
+         * This is the important endpoint because
+         * it runs anomaly detection, prediction,
+         * and risk assessment.
+         */
+
+        let response;
+
+        try {
+            response =
+                await apiRequest(
+                    `/analyze/${encodeURIComponent(
+                        componentId
+                    )}`
+                );
+
+        } catch (analysisError) {
+            console.warn(
+                "GET /analyze/{component_id} failed:",
+                analysisError
+            );
+
+            /*
+             * Compatibility fallback.
+             */
+
+            try {
+                response =
+                    await apiRequest(
+                        `/components/${encodeURIComponent(
+                            componentId
+                        )}`
+                    );
+
+            } catch (componentError) {
+                console.warn(
+                    "GET /components/{component_id} failed:",
+                    componentError
+                );
+
+                response =
+                    findComponent(
+                        componentId
+                    ) || {};
+            }
+        }
+
+        const result =
+            extractAnalysis(response);
+
+        const baseComponent =
+            findComponent(
+                componentId
+            ) || {};
+
+        state.selectedResult = {
+            ...baseComponent,
+            ...result
+        };
+
+        renderAnalysis(
+            state.selectedResult
+        );
+
+        setText(
+            "componentStatus",
+            `${componentId} AI screening complete.`
+        );
+
+    } catch (error) {
+        console.error(
+            "Component analysis failed:",
+            error
+        );
+
+        setText(
+            "componentStatus",
+            `Screening failed: ${error.message}`
+        );
+
+        showError(
+            error.message
+        );
+    }
+}
+
+
+/* ============================================================
+   OPTIONAL POST ANALYSIS
+   ============================================================ */
+
+async function analyzeSelectedComponent() {
+    const componentId =
+        state.selectedComponentId;
+
+    if (!componentId) {
+        return;
+    }
+
+    try {
+        const response =
+            await apiRequest(
+                "/analyze",
+                {
+                    method: "POST",
+                    body: {
+                        component_id:
+                            componentId
+                    }
+                }
+            );
+
+        const result =
+            extractAnalysis(response);
+
+        state.selectedResult = {
+            ...(findComponent(
+                componentId
+            ) || {}),
+            ...result
+        };
+
+        renderAnalysis(
+            state.selectedResult
+        );
+
+    } catch (error) {
+        console.warn(
+            "POST /analyze failed:",
+            error
+        );
+
+        await loadComponent(
+            componentId
+        );
+    }
+}
+
+
+/* ============================================================
+   RENDER COMPLETE ANALYSIS
+   ============================================================ */
+
+function renderAnalysis(data) {
+    if (!data) {
+        return;
+    }
+
+    renderOverview(data);
+    renderRiskPanel(data);
+    renderPrediction(data);
+    renderReasons(data);
+    renderGraph(data);
+    renderEngineeringLimit(data);
+}
+
+
+/* ============================================================
+   COMPONENT OVERVIEW
+   ============================================================ */
+
+function renderOverview(data) {
     const componentId =
         data.component_id ??
         data.id ??
@@ -743,169 +749,369 @@ function updateOverview(data) {
         data.lot ??
         "—";
 
-    const value0 =
-        data.value_0h ??
-        data.value0h ??
-        data["0h"];
-
-    const value24 =
-        data.value_24h ??
-        data.value24h ??
-        data["24h"];
-
     const unit =
         data.unit ??
         "";
 
     const risk =
-        data.risk_level ??
-        data.risk ??
-        "—";
-
-    const normalizedRisk =
-        normalizeRisk(risk);
-
-    let riskClass =
-        "risk-review";
-
-    if (
-        normalizedRisk.includes("NORMAL") ||
-        normalizedRisk.includes("LOW")
-    ) {
-        riskClass = "risk-normal";
-    }
-
-    if (
-        normalizedRisk.includes("HIGH")
-    ) {
-        riskClass = "risk-high";
-    }
-
-    body.innerHTML = `
-        <tr>
-            <td>${escapeHtml(componentId)}</td>
-
-            <td>${escapeHtml(componentType)}</td>
-
-            <td>${escapeHtml(parameter)}</td>
-
-            <td>${escapeHtml(lot)}</td>
-
-            <td>
-                ${escapeHtml(formatNumber(value0))}
-                ${escapeHtml(unit)}
-            </td>
-
-            <td>
-                ${escapeHtml(formatNumber(value24))}
-                ${escapeHtml(unit)}
-            </td>
-
-            <td class="${riskClass}">
-                ${escapeHtml(risk)}
-            </td>
-        </tr>
-    `;
-}
-
-
-/* =========================================================
-   ANOMALY RESULT
-   ========================================================= */
-
-function updateAnomaly(data) {
-
-    const label =
-        String(
-            data.anomaly_label ??
-            data.anomaly ??
-            (
-                Number(data.anomaly_flag) === 1
-                    ? "ANOMALY"
-                    : Number(data.anomaly_flag) === 0
-                        ? "NORMAL"
-                        : "—"
-            )
+        normalizeRisk(
+            data.risk_level ??
+            data.risk
         );
 
-    const element =
-        $("anomalyLabel");
+    const value0 =
+        data.value_0h ??
+        data["0h"];
 
-    if (element) {
+    const value24 =
+        data.value_24h ??
+        data["24h"];
 
-        element.textContent =
-            label;
+    const overviewBody =
+        $("overviewBody") ||
+        $("componentOverviewBody");
 
-        element.className =
-            "result-badge";
+    if (overviewBody) {
+        overviewBody.innerHTML = `
+            <tr>
+                <td>
+                    ${escapeHTML(
+                        componentId
+                    )}
+                </td>
 
-        const normalized =
-            normalizeRisk(label);
+                <td>
+                    ${escapeHTML(
+                        componentType
+                    )}
+                </td>
 
-        if (
-            normalized.includes("NORMAL")
-        ) {
-            element.classList.add(
-                "badge-normal"
-            );
-        } else if (
-            normalized.includes("HIGH") ||
-            normalized.includes("ANOMAL")
-        ) {
-            element.classList.add(
-                "badge-high"
-            );
-        } else {
-            element.classList.add(
-                "badge-review"
-            );
-        }
+                <td>
+                    ${escapeHTML(
+                        parameter
+                    )}
+                </td>
+
+                <td>
+                    ${escapeHTML(
+                        lot
+                    )}
+                </td>
+
+                <td>
+                    ${escapeHTML(
+                        formatValue(
+                            value0,
+                            unit
+                        )
+                    )}
+                </td>
+
+                <td>
+                    ${escapeHTML(
+                        formatValue(
+                            value24,
+                            unit
+                        )
+                    )}
+                </td>
+
+                <td>
+                    <span
+                        class="risk-badge ${riskClass(
+                            risk
+                        )}"
+                    >
+                        ${escapeHTML(
+                            risk
+                        )}
+                    </span>
+                </td>
+            </tr>
+        `;
     }
 
     setText(
-        "anomalyIndex",
-        formatNumber(
-            data.anomaly_index ??
-            data.anomaly_score ??
-            data.anomalyIndex,
-            2
+        "detailComponentId",
+        componentId
+    );
+
+    setText(
+        "detailComponentType",
+        componentType
+    );
+
+    setText(
+        "detailParameter",
+        parameter
+    );
+
+    setText(
+        "detailLot",
+        lot
+    );
+}
+
+
+/* ============================================================
+   RISK PANEL
+   ============================================================ */
+
+function renderRiskPanel(data) {
+    const riskScore =
+        data.risk_score ??
+        data.riskScore;
+
+    const riskLevel =
+        normalizeRisk(
+            data.risk_level ??
+            data.risk ??
+            data.status
+        );
+
+    const anomalyScore =
+        data.anomaly_score ??
+        data.anomaly_index ??
+        data.anomalyIndex;
+
+    const anomalyLabel =
+        data.anomaly_label ??
+        (
+            data.anomaly_flag
+                ? "ANOMALY"
+                : "NORMAL"
+        );
+
+    const earlyDrift =
+        data.early_drift_index ??
+        data.earlyDriftIndex;
+
+    const futureDrift =
+        data.future_drift_index ??
+        data.futureDriftIndex;
+
+    let limitUtilization =
+        data.limit_utilization ??
+        data.limitUtilization;
+
+    if (
+        !Number.isFinite(
+            Number(limitUtilization)
         )
+    ) {
+        limitUtilization =
+            calculateLimitUtilization(
+                data
+            );
+    }
+
+    setText(
+        "riskScore",
+        Number.isFinite(
+            Number(riskScore)
+        )
+            ? formatNumber(
+                riskScore,
+                1
+            )
+            : "—"
+    );
+
+    setText(
+        "riskLevel",
+        riskLevel
     );
 
     setText(
         "anomalyScore",
-        formatNumber(
-            data.anomaly_score ??
-            data.anomaly_raw_score ??
-            data.anomalyScore,
-            3
+        Number.isFinite(
+            Number(anomalyScore)
         )
+            ? formatNumber(
+                anomalyScore,
+                2
+            )
+            : "—"
     );
+
+    setText(
+        "anomalyLabel",
+        anomalyLabel
+    );
+
+    setText(
+        "earlyDriftIndex",
+        Number.isFinite(
+            Number(earlyDrift)
+        )
+            ? formatNumber(
+                earlyDrift,
+                1
+            )
+            : "—"
+    );
+
+    setText(
+        "futureDriftIndex",
+        Number.isFinite(
+            Number(futureDrift)
+        )
+            ? formatNumber(
+                futureDrift,
+                1
+            )
+            : "—"
+    );
+
+    setText(
+        "limitUtilization",
+        Number.isFinite(
+            Number(limitUtilization)
+        )
+            ? `${formatNumber(
+                limitUtilization,
+                2
+            )}%`
+            : "—"
+    );
+
+    const riskElement =
+        $("riskLevel");
+
+    if (riskElement) {
+        riskElement.className =
+            `risk-value ${riskClass(
+                riskLevel
+            )}`;
+    }
 }
 
 
-/* =========================================================
-   PREDICTION RESULT
-   ========================================================= */
+/* ============================================================
+   ENGINEERING LIMIT PANEL
+   ============================================================ */
 
-function updatePrediction(data) {
+function renderEngineeringLimit(data) {
+    const limit =
+        getEngineeringLimit(data);
 
     const unit =
-        data.unit ??
+        data?.unit ||
         "";
 
-    const predicted =
+    const utilization =
+        data?.limit_utilization ??
+        calculateLimitUtilization(
+            data
+        );
+
+    const limitElement =
+        $("engineeringLimit");
+
+    if (limitElement) {
+        if (
+            Number.isFinite(
+                Number(limit)
+            )
+        ) {
+            limitElement.textContent =
+                `${formatNumber(
+                    limit,
+                    2
+                )}${unit ? ` ${unit}` : ""}`;
+        } else {
+            limitElement.textContent =
+                "—";
+        }
+    }
+
+    const utilizationElement =
+        $("limitUtilization");
+
+    if (utilizationElement) {
+        if (
+            Number.isFinite(
+                Number(utilization)
+            )
+        ) {
+            utilizationElement.textContent =
+                `${formatNumber(
+                    utilization,
+                    2
+                )}%`;
+        } else {
+            utilizationElement.textContent =
+                "—";
+        }
+    }
+
+    const progress =
+        $("limitProgress") ||
+        $("utilizationProgress");
+
+    if (progress) {
+        if (
+            Number.isFinite(
+                Number(utilization)
+            )
+        ) {
+            const percentage =
+                Math.max(
+                    0,
+                    Math.min(
+                        100,
+                        Number(
+                            utilization
+                        )
+                    )
+                );
+
+            if (
+                progress.tagName ===
+                "PROGRESS"
+            ) {
+                progress.value =
+                    percentage;
+
+                progress.max =
+                    100;
+            } else {
+                progress.style.width =
+                    `${percentage}%`;
+            }
+        } else {
+            if (
+                progress.tagName ===
+                "PROGRESS"
+            ) {
+                progress.value = 0;
+            } else {
+                progress.style.width =
+                    "0%";
+            }
+        }
+    }
+}
+
+
+/* ============================================================
+   PREDICTION
+   ============================================================ */
+
+function renderPrediction(data) {
+    const unit =
+        data.unit ||
+        "";
+
+    const predicted168 =
         data.predicted_168h ??
-        data.predicted168h ??
-        data.prediction ??
-        data.predicted_value;
+        data.predicted168h;
 
-    const actual =
+    const actual168 =
         data.value_168h ??
-        data.actual_168h ??
-        data.actual168h;
+        data["168h"];
 
-    const predictedSlope =
+    const slope =
         data.predicted_slope ??
         data.predictedSlope;
 
@@ -915,340 +1121,151 @@ function updatePrediction(data) {
 
     setText(
         "predicted168h",
-        predicted !== undefined &&
-        predicted !== null
-            ? `${formatNumber(predicted)} ${unit}`.trim()
-            : "—"
+        formatValue(
+            predicted168,
+            unit
+        )
     );
 
     setText(
         "actual168h",
-        actual !== undefined &&
-        actual !== null
-            ? `${formatNumber(actual)} ${unit}`.trim()
-            : "—"
+        formatValue(
+            actual168,
+            unit
+        )
     );
 
     setText(
         "predictedSlope",
-        formatNumber(
-            predictedSlope,
-            6
+        Number.isFinite(
+            Number(slope)
         )
+            ? formatNumber(
+                slope,
+                6
+            )
+            : "—"
     );
 
     setText(
         "safetySlope",
-        formatNumber(
-            safetySlope,
-            6
+        Number.isFinite(
+            Number(safetySlope)
         )
-    );
-}
-
-
-/* =========================================================
-   RISK RESULT
-   ========================================================= */
-
-function updateRisk(data) {
-
-    const risk =
-        data.risk_level ??
-        data.risk ??
-        "—";
-
-    const normalized =
-        normalizeRisk(risk);
-
-    const element =
-        $("riskLevel");
-
-    if (element) {
-
-        element.textContent =
-            risk;
-
-        element.className =
-            "risk-value";
-
-        if (
-            normalized.includes("NORMAL") ||
-            normalized.includes("LOW")
-        ) {
-            element.classList.add(
-                "normal"
-            );
-        } else if (
-            normalized.includes("HIGH")
-        ) {
-            element.classList.add(
-                "high"
-            );
-        } else {
-            element.classList.add(
-                "review"
-            );
-        }
-    }
-
-    setText(
-        "riskScore",
-        formatNumber(
-            data.risk_score ??
-            data.riskScore,
-            1
-        )
-    );
-
-    setText(
-        "earlyDriftIndex",
-        formatNumber(
-            data.early_drift_index ??
-            data.earlyDriftIndex,
-            1
-        )
-    );
-
-    setText(
-        "futureDriftIndex",
-        formatNumber(
-            data.future_drift_index ??
-            data.futureDriftIndex,
-            1
-        )
-    );
-}
-
-
-/* =========================================================
-   ENGINEERING LIMIT
-   ========================================================= */
-
-function updateEngineeringLimit(data) {
-
-    setText(
-        "limitUtilization",
-        formatPercent(
-            data.limit_utilization ??
-            data.limitUtilization,
-            2
-        )
-    );
-
-    const limit =
-        data.engineering_limit ??
-        data.engineeringLimit;
-
-    const unit =
-        data.unit ??
-        "";
-
-    setText(
-        "engineeringLimit",
-        limit !== undefined &&
-        limit !== null
-            ? `${formatNumber(limit)} ${unit}`.trim()
+            ? formatNumber(
+                safetySlope,
+                6
+            )
             : "—"
     );
 }
 
 
-/* =========================================================
-   MEASUREMENTS
-   ========================================================= */
+/* ============================================================
+   REASONS / EXPLAINABILITY
+   ============================================================ */
 
-function updateMeasurements(data) {
-
-    const unit =
-        data.unit ??
-        "";
-
-    const value0 =
-        data.value_0h ??
-        data.value0h;
-
-    const value24 =
-        data.value_24h ??
-        data.value24h;
-
-    const value96 =
-        data.value_96h ??
-        data.value96h;
-
-    const actual168 =
-        data.value_168h ??
-        data.actual_168h ??
-        data.actual168h;
-
-    const predicted168 =
-        data.predicted_168h ??
-        data.predicted168h;
-
-    const display = (value) => {
-
-        if (
-            value === undefined ||
-            value === null
-        ) {
-            return "—";
-        }
-
-        return `${formatNumber(value)} ${unit}`.trim();
-    };
-
-    setText(
-        "value0h",
-        display(value0)
-    );
-
-    setText(
-        "value24h",
-        display(value24)
-    );
-
-    setText(
-        "value96h",
-        display(value96)
-    );
-
-    setText(
-        "actualMeasurement168h",
-        display(actual168)
-    );
-
-    setText(
-        "measurementPrediction",
-        display(predicted168)
-    );
-}
-
-
-/* =========================================================
-   EXPLAINABILITY REASONS
-   ========================================================= */
-
-function updateReasons(data) {
-
-    const list =
-        $("reasonsList");
-
-    if (!list) {
-        return;
-    }
-
-    let reasons =
-        data.reasons ??
-        data.explanations ??
-        data.reasoning ??
-        [];
-
-    if (!Array.isArray(reasons)) {
-
-        if (typeof reasons === "string") {
-            reasons = [reasons];
-        } else {
-            reasons = [];
-        }
-    }
-
-    if (reasons.length === 0) {
-
-        reasons = [
-            "No additional risk explanations were returned for this component."
-        ];
-    }
-
-    list.innerHTML =
-        reasons
-            .map((reason) => `
-                <li>
-                    ${escapeHtml(reason)}
-                </li>
-            `)
-            .join("");
-}
-
-
-/* =========================================================
-   SVG BURN-IN GRAPH
-   ========================================================= */
-
-function drawBurnInChart(data) {
+function renderReasons(data) {
+    const reasons =
+        Array.isArray(
+            data.reasons
+        )
+            ? data.reasons
+            : [];
 
     const container =
-        $("burnInChart");
+        $("reasonsList") ||
+        $("riskReasons");
 
     if (!container) {
         return;
     }
 
-    const unit =
-        data.unit ??
-        "";
+    if (!reasons.length) {
+        container.innerHTML = `
+            <li>
+                No additional risk factors reported.
+            </li>
+        `;
 
-    const points = [
+        return;
+    }
+
+    container.innerHTML =
+        reasons
+            .map(
+                (reason) => `
+                    <li>
+                        ${escapeHTML(
+                            reason
+                        )}
+                    </li>
+                `
+            )
+            .join("");
+}
+
+
+/* ============================================================
+   BURN-IN GRAPH
+   SVG — NO EXTERNAL DEPENDENCY
+   ============================================================ */
+
+function renderGraph(data) {
+    const container =
+        $("burnInChart") ||
+        $("trendChart") ||
+        $("measurementChart");
+
+    if (!container) {
+        console.warn(
+            "Chart container not found."
+        );
+
+        return;
+    }
+
+    const measurements = [
         {
             hour: 0,
-            label: "0h",
-            value: numberValue(
-                data.value_0h ??
-                data.value0h,
-                NaN
-            ),
-            type: "actual"
+            value: Number(
+                data.value_0h
+            )
         },
 
         {
             hour: 24,
-            label: "24h",
-            value: numberValue(
-                data.value_24h ??
-                data.value24h,
-                NaN
-            ),
-            type: "actual"
+            value: Number(
+                data.value_24h
+            )
         },
 
         {
             hour: 96,
-            label: "96h",
-            value: numberValue(
-                data.value_96h ??
-                data.value96h,
-                NaN
-            ),
-            type: "actual"
+            value: Number(
+                data.value_96h
+            )
         },
 
         {
             hour: 168,
-            label: "168h Actual",
-            value: numberValue(
-                data.value_168h ??
-                data.actual_168h ??
-                data.actual168h,
-                NaN
-            ),
-            type: "actual"
-        },
-
-        {
-            hour: 168,
-            label: "168h Predicted",
-            value: numberValue(
-                data.predicted_168h ??
-                data.predicted168h,
-                NaN
-            ),
-            type: "predicted"
+            value: Number(
+                data.value_168h
+            )
         }
     ].filter(
-        (point) => Number.isFinite(point.value)
+        (point) =>
+            Number.isFinite(
+                point.value
+            )
     );
 
-    if (points.length === 0) {
+    const predictedValue =
+        Number(
+            data.predicted_168h
+        );
 
+    if (!measurements.length) {
         container.innerHTML = `
             <div class="chart-empty">
                 No measurement data available.
@@ -1258,17 +1275,28 @@ function drawBurnInChart(data) {
         return;
     }
 
+    const allValues =
+        measurements.map(
+            (point) =>
+                point.value
+        );
 
-    /*
-       SVG dimensions.
-    */
+    if (
+        Number.isFinite(
+            predictedValue
+        )
+    ) {
+        allValues.push(
+            predictedValue
+        );
+    }
 
     const width = 1000;
-    const height = 430;
+    const height = 420;
 
     const padding = {
         top: 45,
-        right: 55,
+        right: 40,
         bottom: 65,
         left: 75
     };
@@ -1283,714 +1311,659 @@ function drawBurnInChart(data) {
         padding.top -
         padding.bottom;
 
-
-    /*
-       X axis uses actual burn-in hours.
-    */
-
-    const xScale = (hour) => {
-
-        return (
-            padding.left +
-            (
-                hour / 168
-            ) * chartWidth
-        );
-    };
-
-
-    /*
-       Y axis.
-    */
-
-    const values =
-        points.map(
-            (point) => point.value
-        );
-
     let minValue =
-        Math.min(...values);
+        Math.min(
+            ...allValues
+        );
 
     let maxValue =
-        Math.max(...values);
+        Math.max(
+            ...allValues
+        );
 
     const range =
-        maxValue - minValue;
+        maxValue -
+        minValue;
 
     if (range === 0) {
-
         minValue -= 1;
         maxValue += 1;
-
     } else {
+        minValue -=
+            range * 0.12;
 
-        minValue -= range * 0.15;
-        maxValue += range * 0.15;
+        maxValue +=
+            range * 0.12;
     }
 
-    const yScale = (value) => {
+    const xScale = (hour) =>
+        padding.left +
+        (hour / 168) *
+            chartWidth;
 
-        return (
-            padding.top +
-            (
-                (
-                    maxValue - value
-                ) /
-                (
-                    maxValue - minValue
-                )
-            ) * chartHeight
-        );
-    };
+    const yScale = (value) =>
+        padding.top +
+        (
+            (maxValue - value) /
+            (maxValue - minValue)
+        ) *
+            chartHeight;
 
-
-    /*
-       Actual points.
-    */
-
-    const actualPoints =
-        points
-            .filter(
-                (point) =>
-                    point.type === "actual"
-            )
-            .sort(
-                (a, b) =>
-                    a.hour - b.hour
-            );
-
-
-    const predictedPoint =
-        points.find(
-            (point) =>
-                point.type === "predicted"
-        );
-
-
-    const actualPath =
-        actualPoints
+    const linePoints =
+        measurements
             .map(
-                (point, index) => {
-
-                    const x =
-                        xScale(point.hour);
-
-                    const y =
-                        yScale(point.value);
-
-                    return `
-                        ${index === 0 ? "M" : "L"}
-                        ${x}
-                        ${y}
-                    `;
-                }
+                (point) =>
+                    `${xScale(
+                        point.hour
+                    )},${yScale(
+                        point.value
+                    )}`
             )
             .join(" ");
 
+    const areaPoints = [
+        `${xScale(
+            measurements[0].hour
+        )},${padding.top + chartHeight}`,
 
-    /*
-       Prediction line:
-       from last actual point
-       to predicted 168h.
-    */
+        ...measurements.map(
+            (point) =>
+                `${xScale(
+                    point.hour
+                )},${yScale(
+                    point.value
+                )}`
+        ),
 
-    let predictionPath = "";
+        `${xScale(
+            measurements[
+                measurements.length - 1
+            ].hour
+        )},${padding.top + chartHeight}`
+    ].join(" ");
+
+    const predictedStart =
+        measurements.find(
+            (point) =>
+                point.hour === 24
+        ) ||
+        measurements[0];
+
+    let predictionLine = "";
 
     if (
-        actualPoints.length > 0 &&
-        predictedPoint
+        predictedStart &&
+        Number.isFinite(
+            predictedValue
+        )
     ) {
+        predictionLine = `
+            <line
+                x1="${xScale(
+                    predictedStart.hour
+                )}"
+                y1="${yScale(
+                    predictedStart.value
+                )}"
+                x2="${xScale(168)}"
+                y2="${yScale(
+                    predictedValue
+                )}"
+                class="prediction-line"
+            />
 
-        const lastActual =
-            actualPoints[
-                actualPoints.length - 1
-            ];
-
-        predictionPath = `
-            M ${xScale(lastActual.hour)}
-              ${yScale(lastActual.value)}
-
-            L ${xScale(predictedPoint.hour)}
-              ${yScale(predictedPoint.value)}
+            <circle
+                cx="${xScale(168)}"
+                cy="${yScale(
+                    predictedValue
+                )}"
+                r="6"
+                class="prediction-point"
+            />
         `;
     }
 
+    const horizontalGridCount = 6;
 
-    /*
-       Grid lines.
-    */
-
-    const gridLines = [];
-
-    const yTicks = 5;
+    let gridLines = "";
+    let yLabels = "";
 
     for (
         let i = 0;
-        i <= yTicks;
+        i <= horizontalGridCount;
         i++
     ) {
-
         const ratio =
-            i / yTicks;
-
-        const value =
-            maxValue -
-            (
-                ratio *
-                (
-                    maxValue -
-                    minValue
-                )
-            );
+            i /
+            horizontalGridCount;
 
         const y =
             padding.top +
-            ratio * chartHeight;
+            ratio *
+                chartHeight;
 
-        gridLines.push(`
+        const value =
+            maxValue -
+            ratio *
+                (
+                    maxValue -
+                    minValue
+                );
+
+        gridLines += `
             <line
                 x1="${padding.left}"
                 y1="${y}"
-                x2="${width - padding.right}"
+                x2="${
+                    width -
+                    padding.right
+                }"
                 y2="${y}"
-                stroke="#26384a"
-                stroke-width="1"
+                class="chart-grid"
             />
+        `;
 
+        yLabels += `
             <text
-                x="${padding.left - 12}"
-                y="${y + 4}"
+                x="${
+                    padding.left -
+                    15
+                }"
+                y="${y + 5}"
                 text-anchor="end"
-                fill="#748092"
-                font-size="12"
+                class="chart-axis-label"
             >
-                ${formatNumber(value, 2)}
-            </text>
-        `);
-    }
-
-
-    /*
-       X ticks.
-    */
-
-    const xTicks =
-        [0, 24, 96, 168]
-            .map((hour) => {
-
-                const x =
-                    xScale(hour);
-
-                return `
-                    <line
-                        x1="${x}"
-                        y1="${padding.top}"
-                        x2="${x}"
-                        y2="${height - padding.bottom}"
-                        stroke="#1c2a38"
-                        stroke-width="1"
-                    />
-
-                    <text
-                        x="${x}"
-                        y="${height - padding.bottom + 28}"
-                        text-anchor="middle"
-                        fill="#748092"
-                        font-size="12"
-                    >
-                        ${hour}h
-                    </text>
-                `;
-            })
-            .join("");
-
-
-    /*
-       Actual point circles.
-    */
-
-    const actualCircles =
-        actualPoints
-            .map((point) => {
-
-                const x =
-                    xScale(point.hour);
-
-                const y =
-                    yScale(point.value);
-
-                return `
-                    <circle
-                        cx="${x}"
-                        cy="${y}"
-                        r="6"
-                        fill="#64d6b4"
-                        stroke="#0c141d"
-                        stroke-width="3"
-                    />
-
-                    <text
-                        x="${x}"
-                        y="${y - 14}"
-                        text-anchor="middle"
-                        fill="#aab4c2"
-                        font-size="11"
-                    >
-                        ${formatNumber(point.value, 2)}
-                    </text>
-                `;
-            })
-            .join("");
-
-
-    /*
-       Predicted point.
-    */
-
-    let predictedCircle = "";
-
-    if (predictedPoint) {
-
-        const x =
-            xScale(predictedPoint.hour);
-
-        const y =
-            yScale(predictedPoint.value);
-
-        predictedCircle = `
-            <circle
-                cx="${x}"
-                cy="${y}"
-                r="7"
-                fill="#77adf2"
-                stroke="#0c141d"
-                stroke-width="3"
-            />
-
-            <text
-                x="${x - 10}"
-                y="${y - 14}"
-                text-anchor="end"
-                fill="#aab4c2"
-                font-size="11"
-            >
-                Pred: ${formatNumber(predictedPoint.value, 2)}
+                ${formatNumber(
+                    value,
+                    1
+                )}
             </text>
         `;
     }
 
+    const xTicks = [
+        0,
+        24,
+        48,
+        72,
+        96,
+        120,
+        144,
+        168
+    ];
 
-    /*
-       SVG.
-    */
+    let xLabels = "";
+
+    xTicks.forEach(
+        (hour) => {
+            const x =
+                xScale(hour);
+
+            xLabels += `
+                <line
+                    x1="${x}"
+                    y1="${padding.top}"
+                    x2="${x}"
+                    y2="${
+                        padding.top +
+                        chartHeight
+                    }"
+                    class="chart-grid vertical"
+                />
+
+                <text
+                    x="${x}"
+                    y="${
+                        height -
+                        30
+                    }"
+                    text-anchor="middle"
+                    class="chart-axis-label"
+                >
+                    ${hour}h
+                </text>
+            `;
+        }
+    );
+
+    const circles =
+        measurements
+            .map(
+                (point) => `
+                    <circle
+                        cx="${xScale(
+                            point.hour
+                        )}"
+                        cy="${yScale(
+                            point.value
+                        )}"
+                        r="6"
+                        class="measurement-point"
+                    >
+                        <title>
+                            ${point.hour}h:
+                            ${formatValue(
+                                point.value,
+                                data.unit ||
+                                    ""
+                            )}
+                        </title>
+                    </circle>
+                `
+            )
+            .join("");
 
     container.innerHTML = `
         <svg
+            class="burnin-svg"
             viewBox="0 0 ${width} ${height}"
-            preserveAspectRatio="xMidYMid meet"
             role="img"
-            aria-label="Burn-in measurement trend"
+            aria-label="Burn-in measurement and AI prediction chart"
         >
 
-            <text
-                x="${padding.left}"
-                y="24"
-                fill="#aab4c2"
-                font-size="14"
-                font-weight="600"
-            >
-                Burn-In Measurement Trend (${escapeHtml(unit)})
-            </text>
+            ${gridLines}
 
+            ${xLabels}
 
-            ${gridLines.join("")}
+            ${yLabels}
 
-
-            ${xTicks}
-
-
-            <!-- Actual measurement line -->
-
-            <path
-                d="${actualPath}"
-                fill="none"
-                stroke="#64d6b4"
-                stroke-width="3"
-                stroke-linejoin="round"
-                stroke-linecap="round"
+            <polygon
+                points="${areaPoints}"
+                class="measurement-area"
             />
 
-
-            <!-- Prediction line -->
-
-            ${
-                predictionPath
-                    ? `
-                        <path
-                            d="${predictionPath}"
-                            fill="none"
-                            stroke="#77adf2"
-                            stroke-width="3"
-                            stroke-dasharray="8 7"
-                            stroke-linejoin="round"
-                            stroke-linecap="round"
-                        />
-                    `
-                    : ""
-            }
-
-
-            ${actualCircles}
-
-
-            ${predictedCircle}
-
-
-            <!-- Legend -->
-
-            <line
-                x1="${width - 245}"
-                y1="26"
-                x2="${width - 215}"
-                y2="26"
-                stroke="#64d6b4"
-                stroke-width="3"
+            <polyline
+                points="${linePoints}"
+                class="measurement-line"
             />
 
-            <text
-                x="${width - 207}"
-                y="30"
-                fill="#aab4c2"
-                font-size="11"
-            >
-                Actual
-            </text>
+            ${predictionLine}
 
-
-            <line
-                x1="${width - 135}"
-                y1="26"
-                x2="${width - 105}"
-                y2="26"
-                stroke="#77adf2"
-                stroke-width="3"
-                stroke-dasharray="6 5"
-            />
-
-            <text
-                x="${width - 98}"
-                y="30"
-                fill="#aab4c2"
-                font-size="11"
-            >
-                Predicted
-            </text>
-
-
-            <!-- Axis labels -->
+            ${circles}
 
             <text
                 x="${width / 2}"
-                y="${height - 15}"
+                y="${height - 5}"
                 text-anchor="middle"
-                fill="#748092"
-                font-size="12"
+                class="chart-axis-title"
             >
-                Burn-In Time
+                Burn-In Time (Hours)
             </text>
 
+            <text
+                x="22"
+                y="${height / 2}"
+                text-anchor="middle"
+                transform="rotate(-90 22 ${
+                    height / 2
+                })"
+                class="chart-axis-title"
+            >
+                ${escapeHTML(
+                    data.parameter_name ||
+                    data.parameter ||
+                    "Measured Value"
+                )}
+            </text>
         </svg>
+
+        <div class="chart-legend">
+
+            <div class="legend-item">
+                <span
+                    class="legend-line measured"
+                ></span>
+
+                Measured Value
+            </div>
+
+            <div class="legend-item">
+                <span
+                    class="legend-line predicted"
+                ></span>
+
+                AI Predicted Trend
+            </div>
+
+        </div>
     `;
 }
 
 
-/* =========================================================
-   UPDATE COMPLETE DASHBOARD
-   ========================================================= */
+/* ============================================================
+   ERROR DISPLAY
+   ============================================================ */
 
-function updateDashboard(response) {
+function showError(message) {
+    const container =
+        $("errorMessage") ||
+        $("componentStatus");
 
-    const data =
-        normalizeAnalysis(response);
+    if (!container) {
+        return;
+    }
 
-    console.log(
-        "Analysis result:",
-        data
-    );
-
-    updateOverview(data);
-
-    updateAnomaly(data);
-
-    updatePrediction(data);
-
-    updateRisk(data);
-
-    updateEngineeringLimit(data);
-
-    updateMeasurements(data);
-
-    updateReasons(data);
-
-    drawBurnInChart(data);
+    container.textContent =
+        `Error: ${message}`;
 }
 
 
-/* =========================================================
-   COMPONENT SELECTION
-   ========================================================= */
+/* ============================================================
+   CSV UPLOAD
+   ============================================================ */
 
-async function handleComponentSelection() {
-
-    const select =
-        $("componentSelect");
-
-    if (!select) {
+async function uploadCSV(file) {
+    if (!file) {
         return;
     }
 
-    const componentId =
-        select.value;
+    const uploadStatus =
+        $("uploadStatus") ||
+        $("uploadMessage");
 
-    if (!componentId) {
-        return;
+    if (uploadStatus) {
+        uploadStatus.textContent =
+            "Uploading CSV...";
     }
-
-    setText(
-        "componentStatus",
-        `Analyzing ${componentId}...`
-    );
-
-    select.disabled = true;
 
     try {
+        const formData =
+            new FormData();
+
+        formData.append(
+            "file",
+            file
+        );
 
         const response =
-            await analyzeComponent(
-                componentId
+            await fetch(
+                `${API_BASE}/upload-csv`,
+                {
+                    method: "POST",
+                    body: formData
+                }
             );
 
-        updateDashboard(
-            response
-        );
+        const contentType =
+            response.headers.get(
+                "content-type"
+            ) || "";
 
-        setText(
-            "componentStatus",
-            `${componentId} analyzed successfully.`
-        );
+        let data;
+
+        if (
+            contentType.includes(
+                "application/json"
+            )
+        ) {
+            data =
+                await response.json();
+        } else {
+            data = {
+                detail:
+                    await response.text()
+            };
+        }
+
+        if (!response.ok) {
+            throw new Error(
+                data?.detail ||
+                data?.message ||
+                "CSV upload failed."
+            );
+        }
+
+        if (uploadStatus) {
+            uploadStatus.textContent =
+                data?.message ||
+                "CSV uploaded successfully.";
+        }
+
+        state.selectedComponentId =
+            null;
+
+        await refreshDashboard();
 
     } catch (error) {
-
         console.error(
-            "Component analysis failed:",
+            "CSV upload failed:",
             error
         );
 
-        setText(
-            "componentStatus",
-            `Analysis failed: ${error.message}`
-        );
-
-        const body =
-            $("overviewBody");
-
-        if (body) {
-
-            body.innerHTML = `
-                <tr>
-                    <td colspan="7">
-                        Analysis failed:
-                        ${escapeHtml(error.message)}
-                    </td>
-                </tr>
-            `;
+        if (uploadStatus) {
+            uploadStatus.textContent =
+                `Upload failed: ${error.message}`;
         }
 
-    } finally {
-
-        select.disabled = false;
+        showError(
+            error.message
+        );
     }
 }
 
 
-/* =========================================================
-   REFRESH DASHBOARD
-   ========================================================= */
+/* ============================================================
+   EVENT LISTENERS
+   ============================================================ */
 
-async function refreshDashboard() {
+function registerEvents() {
+    const select =
+        $("componentSelect") ||
+        $("component-selector");
 
-    const button =
-        $("refreshButton");
+    if (select) {
+        select.addEventListener(
+            "change",
+            async (event) => {
+                const componentId =
+                    event.target.value;
 
-    if (button) {
+                if (!componentId) {
+                    return;
+                }
 
-        button.disabled = true;
-
-        button.textContent =
-            "Refreshing...";
-    }
-
-    try {
-
-        await checkHealth();
-
-        const components =
-            await loadComponents();
-
-        await loadSummaryCounts(
-            components
+                await loadComponent(
+                    componentId
+                );
+            }
         );
-
-        const select =
-            $("componentSelect");
-
-        /*
-           Preserve selected component if possible.
-        */
-
-        if (
-            select &&
-            select.value
-        ) {
-
-            await handleComponentSelection();
-        }
-
-    } finally {
-
-        if (button) {
-
-            button.disabled = false;
-
-            button.textContent =
-                "Refresh";
-        }
     }
-}
-
-
-/* =========================================================
-   INITIALIZE APPLICATION
-   ========================================================= */
-
-async function initializeApp() {
-
-    console.log(
-        "AegisBurn AI frontend starting..."
-    );
 
     const refreshButton =
-        $("refreshButton");
-
-    const componentSelect =
-        $("componentSelect");
-
-
-    /*
-       Register events.
-    */
+        $("refreshButton") ||
+        $("refresh");
 
     if (refreshButton) {
-
         refreshButton.addEventListener(
             "click",
             refreshDashboard
         );
     }
 
+    const analyzeButton =
+        $("analyzeButton");
 
-    if (componentSelect) {
+    if (analyzeButton) {
+        analyzeButton.addEventListener(
+            "click",
+            analyzeSelectedComponent
+        );
+    }
 
-        componentSelect.addEventListener(
+    /*
+     * Support multiple possible upload
+     * input IDs so the frontend remains
+     * compatible with the current HTML.
+     */
+
+    const fileInput =
+        $("csvFile") ||
+        $("csvInput") ||
+        $("fileInput") ||
+        $("uploadFile");
+
+    const uploadButton =
+        $("uploadButton") ||
+        $("uploadCsvButton") ||
+        $("uploadCSVButton");
+
+    if (fileInput) {
+        fileInput.addEventListener(
             "change",
-            handleComponentSelection
+            () => {
+                const file =
+                    fileInput.files?.[0];
+
+                if (file) {
+                    const fileName =
+                        $("selectedFileName");
+
+                    if (fileName) {
+                        fileName.textContent =
+                            file.name;
+                    }
+                }
+            }
         );
     }
-
-
-    /*
-       Check backend.
-    */
-
-    const healthy =
-        await checkHealth();
-
-    if (!healthy) {
-
-        setText(
-            "componentStatus",
-            "Backend connection failed. Make sure Uvicorn is running on port 8001."
-        );
-
-        return;
-    }
-
-
-    /*
-       Load component list.
-    */
-
-    const components =
-        await loadComponents();
-
-
-    /*
-       Load dashboard totals.
-    */
-
-    await loadSummaryCounts(
-        components
-    );
-
-
-    /*
-       Automatically analyze the first component.
-    */
-
-    const select =
-        $("componentSelect");
 
     if (
-        select &&
-        select.options.length > 1
+        uploadButton &&
+        fileInput
     ) {
+        uploadButton.addEventListener(
+            "click",
+            async () => {
+                const file =
+                    fileInput.files?.[0];
 
-        const firstOption =
-            Array.from(select.options)
-                .find(
-                    (option) =>
-                        option.value
+                if (!file) {
+                    showError(
+                        "Please select a CSV file first."
+                    );
+
+                    return;
+                }
+
+                await uploadCSV(
+                    file
                 );
+            }
+        );
+    }
+}
 
-        if (firstOption) {
 
-            select.value =
-                firstOption.value;
+/* ============================================================
+   REFRESH DASHBOARD
+   ============================================================ */
 
-            await handleComponentSelection();
-        }
+async function refreshDashboard() {
+    const refreshButton =
+        $("refreshButton") ||
+        $("refresh");
+
+    if (refreshButton) {
+        refreshButton.disabled =
+            true;
+
+        refreshButton.textContent =
+            "Refreshing...";
     }
 
+    try {
+        const online =
+            await checkConnection();
+
+        if (!online) {
+            throw new Error(
+                "Cannot connect to AegisBurn backend."
+            );
+        }
+
+        const components =
+            await loadComponents();
+
+        const select =
+            $("componentSelect") ||
+            $("component-selector");
+
+        if (
+            components.length > 0 &&
+            select
+        ) {
+            const componentId =
+                state.selectedComponentId ||
+                select.value;
+
+            if (componentId) {
+                select.value =
+                    componentId;
+
+                await loadComponent(
+                    componentId
+                );
+            }
+        }
+
+    } catch (error) {
+        console.error(
+            "Dashboard refresh failed:",
+            error
+        );
+
+        showError(
+            error.message
+        );
+
+    } finally {
+        if (refreshButton) {
+            refreshButton.disabled =
+                false;
+
+            refreshButton.textContent =
+                "Refresh";
+        }
+    }
+}
+
+
+/* ============================================================
+   APPLICATION STARTUP
+   ============================================================ */
+
+async function initializeApp() {
     console.log(
-        "AegisBurn AI frontend ready."
+        "AEGISBURN AI FRONTEND STARTING..."
+    );
+
+    setConnectionState(
+        "connecting",
+        "Connecting..."
+    );
+
+    registerEvents();
+
+    await refreshDashboard();
+
+    console.log(
+        "AEGISBURN AI FRONTEND READY"
     );
 }
 
 
-/* =========================================================
-   START AFTER DOM LOAD
-   ========================================================= */
+/* ============================================================
+   START WHEN PAGE IS READY
+   ============================================================ */
 
 if (
-    document.readyState === "loading"
+    document.readyState ===
+    "loading"
 ) {
-
     document.addEventListener(
         "DOMContentLoaded",
         initializeApp
     );
-
 } else {
-
     initializeApp();
 }

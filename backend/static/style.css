@@ -2516,3 +2516,191 @@ footer span:last-child {
     }
 
 }
+/* ============================================================
+   AEGISBURN AI — RISK STATUS COLORS
+   ============================================================ */
+
+/* Normal / Low risk */
+.risk-badge.normal,
+.risk-badge.low,
+.riskBadge.normal,
+.riskBadge.low {
+    color: #22c55e !important;
+    background: rgba(34, 197, 94, 0.12) !important;
+    border: 1px solid rgba(34, 197, 94, 0.35) !important;
+}
+
+/* Review / Medium risk */
+.risk-badge.review,
+.risk-badge.medium,
+.riskBadge.review,
+.riskBadge.medium {
+    color: #f59e0b !important;
+    background: rgba(245, 158, 11, 0.12) !important;
+    border: 1px solid rgba(245, 158, 11, 0.35) !important;
+}
+
+/* High risk */
+.risk-badge.high-risk,
+.risk-badge.high,
+.riskBadge.high-risk,
+.riskBadge.high {
+    color: #f97316 !important;
+    background: rgba(249, 115, 22, 0.12) !important;
+    border: 1px solid rgba(249, 115, 22, 0.35) !important;
+}
+
+/* Critical risk */
+.risk-badge.critical,
+.riskBadge.critical {
+    color: #ef4444 !important;
+    background: rgba(239, 68, 68, 0.14) !important;
+    border: 1px solid rgba(239, 68, 68, 0.40) !important;
+}
+
+/* Risk progress bar */
+.risk-progress-fill.normal {
+    background: #22c55e !important;
+}
+
+.risk-progress-fill.review,
+.risk-progress-fill.medium {
+    background: #f59e0b !important;
+}
+
+.risk-progress-fill.high-risk,
+.risk-progress-fill.high {
+    background: #f97316 !important;
+}
+
+.risk-progress-fill.critical {
+    background: #ef4444 !important;
+}
+/* ============================================================
+   RISK BADGE - TEXT ALIGNMENT
+   ============================================================ */
+
+.risk-badge,
+#riskBadge,
+.riskBadge {
+    display: inline-flex !important;
+
+    align-items: center !important;
+    justify-content: center !important;
+
+    text-align: center !important;
+    vertical-align: middle !important;
+
+    min-width: 108px;
+    min-height: 34px;
+
+    padding: 7px 14px !important;
+
+    box-sizing: border-box;
+
+    border-radius: 999px;
+
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1 !important;
+    letter-spacing: 1px;
+
+    white-space: nowrap;
+
+    position: relative;
+    top: 0;
+
+    margin: 0;
+}
+
+/* NORMAL */
+
+.risk-badge.normal,
+#riskBadge.normal,
+.riskBadge.normal {
+    color: #22c55e !important;
+    background: rgba(34, 197, 94, 0.10) !important;
+    border: 1px solid rgba(34, 197, 94, 0.45) !important;
+}
+
+/* REVIEW */
+
+.risk-badge.review,
+#riskBadge.review,
+.riskBadge.review {
+    color: #f59e0b !important;
+    background: rgba(245, 158, 11, 0.10) !important;
+    border: 1px solid rgba(245, 158, 11, 0.45) !important;
+}
+
+/* HIGH RISK */
+
+.risk-badge.high-risk,
+#riskBadge.high-risk,
+.riskBadge.high-risk {
+    color: #f97316 !important;
+    background: rgba(249, 115, 22, 0.10) !important;
+    border: 1px solid rgba(249, 115, 22, 0.50) !important;
+}
+
+/* CRITICAL */
+
+.risk-badge.critical,
+#riskBadge.critical,
+.riskBadge.critical {
+    color: #ef4444 !important;
+    background: rgba(239, 68, 68, 0.10) !important;
+    border: 1px solid rgba(239, 68, 68, 0.50) !important;
+}
+
+
+/* ============================================================
+   RISK HEADER ALIGNMENT
+   ============================================================ */
+
+.risk-header,
+.risk-assessment-header,
+.component-risk-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+}
+
+
+/* ============================================================
+   COMPONENT RISK TITLE
+   ============================================================ */
+
+.risk-header h1,
+.risk-header h2,
+.risk-header h3,
+.component-risk-header h1,
+.component-risk-header h2,
+.component-risk-header h3 {
+    margin: 0;
+    line-height: 1.2;
+}
+
+
+/* ============================================================
+   MOBILE
+   ============================================================ */
+
+@media (max-width: 600px) {
+    .risk-header,
+    .risk-assessment-header,
+    .component-risk-header {
+        align-items: flex-start;
+    }
+
+    .risk-badge,
+    #riskBadge,
+    .riskBadge {
+        min-width: 100px;
+        min-height: 32px;
+        padding: 6px 12px !important;
+        font-size: 12px;
+    }
+}

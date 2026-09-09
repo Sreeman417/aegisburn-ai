@@ -1,103 +1,835 @@
 """
-Parameter-specific anomaly detection for burn-in screening.
+AegisBurn AI - Unsupervised Anomaly Detection
+================================================
 
-Module A:
-Detect abnormal early-life component behavior using only:
-    - value_0h
-    - value_24h
-    - early drift features
-    - lot/reference-normalized features
+Detects abnormal burn-in behavior in electronic components.
 
-Important:
-    value_96h and value_168h are NOT used by the anomaly model.
+Important design rules
+----------------------
+1. No defect_type column is required.
+2. No is_defective column is required.
+3. Anomaly detection uses only measurements available before 168h:
+       value_0h
+       value_24h
+       value_96h
+4. value_168h is NOT used by the anomaly detector.
+5. Each component family gets its own Isolation Forest model.
+6. Anomaly scores are calibrated continuously from the training
+   distribution instead of using a direct 0/100 mapping.
+7. The module remains compatible with the AegisBurn backend registry.
 """
 
 from __future__ import annotations
 
+import argparse
+import os
+import pickle
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 # ---------------------------------------------------------------------
-# Features allowed for EARLY anomaly screening
+# Paths
 # ---------------------------------------------------------------------
 
-EARLY_FEATURES: List[str] = [
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_DATASET_PATH = (
+    PROJECT_ROOT
+    / "src"
+    / "data"
+    / "raw"
+    / "component_data.csv"
+)
+
+DEFAULT_MODEL_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "anomaly"
+)
+
+DEFAULT_MODEL_PATH = (
+    DEFAULT_MODEL_DIR
+    / "anomaly_models.pkl"
+)
+
+
+# ---------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------
+
+GROUP_COLUMNS = [
+    "component_type",
+    "parameter_name",
+]
+
+IDENTIFIER_COLUMNS = [
+    "component_id",
+    "component_type",
+    "parameter_name",
+    "unit",
+    "lot_id",
+]
+
+MEASUREMENT_COLUMNS = [
     "value_0h",
     "value_24h",
-    "drift_0_24",
-    "slope_early",
-    "ratio_24_0",
-    "z_score_0h",
-    "z_score_24h",
-    "z_score_slope_early",
+    "value_96h",
+    "value_168h",
 ]
 
 
 # ---------------------------------------------------------------------
-# Result container
+# IMPORTANT:
+# These are the only features used by the anomaly detector.
+#
+# value_168h is intentionally excluded.
+# The goal is to detect abnormal behavior before the final 168h
+# burn-in measurement is known.
+# ---------------------------------------------------------------------
+
+TRAJECTORY_FEATURES = [
+    "value_0h",
+    "value_24h",
+    "value_96h",
+
+    "drift_0_24",
+    "drift_24_96",
+    "drift_0_96",
+
+    "relative_drift_0_24",
+    "relative_drift_24_96",
+    "relative_drift_0_96",
+
+    "slope_early",
+    "slope_mid",
+
+    "ratio_24_0",
+    "ratio_96_24",
+    "ratio_96_0",
+
+    "acceleration",
+]
+
+
+# ---------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert a value to float safely."""
+    try:
+        result = float(value)
+
+        if not np.isfinite(result):
+            return default
+
+        return result
+
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_divide(
+    numerator: Any,
+    denominator: Any,
+    epsilon: float = 1e-9,
+) -> float:
+    """Safe scalar division."""
+    num = _safe_float(numerator)
+    den = _safe_float(denominator)
+
+    if abs(den) < epsilon:
+        den = epsilon if den >= 0 else -epsilon
+
+    result = num / den
+
+    if not np.isfinite(result):
+        return 0.0
+
+    return float(result)
+
+
+def _clip_float(
+    value: float,
+    low: float,
+    high: float,
+) -> float:
+    """Finite numeric clipping."""
+    if not np.isfinite(value):
+        return low
+
+    return float(max(low, min(high, value)))
+
+
+def _sigmoid(value: float) -> float:
+    """
+    Numerically stable sigmoid.
+    """
+    value = _safe_float(value)
+
+    if value >= 40:
+        return 1.0
+
+    if value <= -40:
+        return 0.0
+
+    return 1.0 / (1.0 + np.exp(-value))
+
+
+def _robust_scale(values: np.ndarray) -> float:
+    """
+    Robust scale based on MAD.
+
+    Falls back to standard deviation and finally 1.0.
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return 1.0
+
+    median = float(np.median(values))
+
+    mad = float(
+        np.median(
+            np.abs(values - median)
+        )
+    )
+
+    scale = 1.4826 * mad
+
+    if np.isfinite(scale) and scale > 1e-9:
+        return float(scale)
+
+    std = float(np.std(values))
+
+    if np.isfinite(std) and std > 1e-9:
+        return float(std)
+
+    return 1.0
+
+
+def _percentile(values: np.ndarray, q: float) -> float:
+    """
+    Safe percentile.
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return 0.0
+
+    return float(np.percentile(values, q))
+
+
+# ---------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------
+
+def validate_dataset(df: pd.DataFrame) -> None:
+    """
+    Validate the minimum dataset structure.
+
+    defect_type and is_defective are deliberately NOT required.
+    """
+    required = [
+        "component_id",
+        "component_type",
+        "parameter_name",
+        "unit",
+        "lot_id",
+        "value_0h",
+        "value_24h",
+        "value_96h",
+    ]
+
+    missing = [
+        column
+        for column in required
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Dataset is missing required columns: "
+            + ", ".join(missing)
+        )
+
+
+def load_dataset(
+    dataset_path: str | os.PathLike[str],
+) -> pd.DataFrame:
+    """
+    Load and validate the burn-in dataset.
+    """
+    path = Path(dataset_path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}"
+        )
+
+    df = pd.read_csv(path)
+
+    validate_dataset(df)
+
+    numeric_columns = [
+        "value_0h",
+        "value_24h",
+        "value_96h",
+    ]
+
+    if "value_168h" in df.columns:
+        numeric_columns.append("value_168h")
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=[
+            "component_type",
+            "parameter_name",
+            "value_0h",
+            "value_24h",
+            "value_96h",
+        ]
+    ).copy()
+
+    return df
+
+
+# ---------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------
+
+def create_anomaly_features(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Create anomaly-detection features using only 0h, 24h and 96h.
+
+    168h is intentionally ignored.
+    """
+    result = df.copy()
+
+    v0 = pd.to_numeric(
+        result["value_0h"],
+        errors="coerce",
+    )
+
+    v24 = pd.to_numeric(
+        result["value_24h"],
+        errors="coerce",
+    )
+
+    v96 = pd.to_numeric(
+        result["value_96h"],
+        errors="coerce",
+    )
+
+    eps = 1e-9
+
+    # -------------------------------------------------------------
+    # Absolute drift
+    # -------------------------------------------------------------
+
+    result["drift_0_24"] = v24 - v0
+    result["drift_24_96"] = v96 - v24
+    result["drift_0_96"] = v96 - v0
+
+    # -------------------------------------------------------------
+    # Relative drift
+    # -------------------------------------------------------------
+
+    result["relative_drift_0_24"] = (
+        result["drift_0_24"]
+        / v0.abs().clip(lower=eps)
+    )
+
+    result["relative_drift_24_96"] = (
+        result["drift_24_96"]
+        / v24.abs().clip(lower=eps)
+    )
+
+    result["relative_drift_0_96"] = (
+        result["drift_0_96"]
+        / v0.abs().clip(lower=eps)
+    )
+
+    # -------------------------------------------------------------
+    # Slopes
+    #
+    # 0 -> 24h = 24 hours
+    # 24 -> 96h = 72 hours
+    # -------------------------------------------------------------
+
+    result["slope_early"] = (
+        result["drift_0_24"]
+        / 24.0
+    )
+
+    result["slope_mid"] = (
+        result["drift_24_96"]
+        / 72.0
+    )
+
+    # -------------------------------------------------------------
+    # Ratios
+    # -------------------------------------------------------------
+
+    result["ratio_24_0"] = (
+        v24
+        / v0.abs().clip(lower=eps)
+    )
+
+    result["ratio_96_24"] = (
+        v96
+        / v24.abs().clip(lower=eps)
+    )
+
+    result["ratio_96_0"] = (
+        v96
+        / v0.abs().clip(lower=eps)
+    )
+
+    # -------------------------------------------------------------
+    # Acceleration
+    #
+    # Difference between early and mid slopes.
+    # -------------------------------------------------------------
+
+    result["acceleration"] = (
+        result["slope_mid"]
+        - result["slope_early"]
+    )
+
+    # -------------------------------------------------------------
+    # Clean numerical values
+    # -------------------------------------------------------------
+
+    for column in TRAJECTORY_FEATURES:
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="coerce",
+        )
+
+        result[column] = (
+            result[column]
+            .replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            .fillna(0.0)
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Unsupervised normal-core selection
+# ---------------------------------------------------------------------
+
+def _build_stability_index(
+    feature_df: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Build an unsupervised stability/degradation magnitude index.
+
+    This does NOT use labels.
+
+    The index is only used to identify the stable core of the
+    training distribution. Isolation Forest is then fitted on that
+    core.
+
+    This is useful because the supplied prototype dataset contains
+    many abnormal trajectories. Training directly on all rows can
+    cause a large fraction of abnormal trajectories to be treated
+    as normal.
+    """
+    early = np.abs(
+        feature_df["relative_drift_0_24"].to_numpy(
+            dtype=float
+        )
+    )
+
+    mid = np.abs(
+        feature_df["relative_drift_24_96"].to_numpy(
+            dtype=float
+        )
+    )
+
+    cumulative = np.abs(
+        feature_df["relative_drift_0_96"].to_numpy(
+            dtype=float
+        )
+    )
+
+    acceleration = np.abs(
+        feature_df["acceleration"].to_numpy(
+            dtype=float
+        )
+    )
+
+    # Robustly scale each dimension.
+    early_scale = _robust_scale(early)
+    mid_scale = _robust_scale(mid)
+    cumulative_scale = _robust_scale(cumulative)
+    acceleration_scale = _robust_scale(acceleration)
+
+    score = (
+        0.25 * (early / early_scale)
+        + 0.30 * (mid / mid_scale)
+        + 0.30 * (cumulative / cumulative_scale)
+        + 0.15 * (acceleration / acceleration_scale)
+    )
+
+    score = np.asarray(
+        score,
+        dtype=float,
+    )
+
+    score[
+        ~np.isfinite(score)
+    ] = 0.0
+
+    return score
+
+
+def select_unsupervised_core(
+    feature_df: pd.DataFrame,
+    core_fraction: float = 0.55,
+) -> pd.DataFrame:
+    """
+    Select a stable unsupervised core from the training data.
+
+    No defect labels are used.
+
+    The default 55% is intentionally close to the expected normal
+    majority in the prototype data, but it is not based on the
+    removed is_defective column.
+    """
+    if len(feature_df) <= 20:
+        return feature_df.copy()
+
+    core_fraction = _clip_float(
+        core_fraction,
+        0.40,
+        0.80,
+    )
+
+    stability = _build_stability_index(
+        feature_df
+    )
+
+    cutoff = np.quantile(
+        stability,
+        core_fraction,
+    )
+
+    mask = stability <= cutoff
+
+    core = feature_df.loc[mask].copy()
+
+    minimum_core = max(
+        20,
+        int(len(feature_df) * 0.30),
+    )
+
+    if len(core) < minimum_core:
+        order = np.argsort(stability)
+
+        selected = order[
+            :minimum_core
+        ]
+
+        core = feature_df.iloc[
+            selected
+        ].copy()
+
+    return core
+
+
+# ---------------------------------------------------------------------
+# Calibration
 # ---------------------------------------------------------------------
 
 @dataclass
-class AnomalyResult:
+class ScoreCalibration:
     """
-    Result returned for one component.
+    Statistics required to turn Isolation Forest raw scores into
+    continuous 0-100 anomaly scores.
     """
 
-    is_anomaly: bool
-    anomaly_score: float
-    raw_score: float
-    parameter_name: str
-    component_type: str
+    median: float = 0.0
+    scale: float = 1.0
+    low_percentile: float = 0.0
+    high_percentile: float = 0.0
+    threshold_raw: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "median": float(self.median),
+            "scale": float(self.scale),
+            "low_percentile": float(
+                self.low_percentile
+            ),
+            "high_percentile": float(
+                self.high_percentile
+            ),
+            "threshold_raw": float(
+                self.threshold_raw
+            ),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+    ) -> "ScoreCalibration":
+        return cls(
+            median=_safe_float(
+                data.get("median"),
+                0.0,
+            ),
+            scale=max(
+                _safe_float(
+                    data.get("scale"),
+                    1.0,
+                ),
+                1e-9,
+            ),
+            low_percentile=_safe_float(
+                data.get("low_percentile"),
+                0.0,
+            ),
+            high_percentile=_safe_float(
+                data.get("high_percentile"),
+                0.0,
+            ),
+            threshold_raw=_safe_float(
+                data.get("threshold_raw"),
+                0.0,
+            ),
+        )
+
+
+def fit_score_calibration(
+    raw_scores: np.ndarray,
+    threshold_raw: float,
+) -> ScoreCalibration:
+    """
+    Fit robust score calibration.
+    """
+    raw_scores = np.asarray(
+        raw_scores,
+        dtype=float,
+    )
+
+    raw_scores = raw_scores[
+        np.isfinite(raw_scores)
+    ]
+
+    if len(raw_scores) == 0:
+        return ScoreCalibration(
+            median=0.0,
+            scale=1.0,
+            low_percentile=0.0,
+            high_percentile=0.0,
+            threshold_raw=threshold_raw,
+        )
+
+    median = float(
+        np.median(raw_scores)
+    )
+
+    scale = _robust_scale(
+        raw_scores
+    )
+
+    return ScoreCalibration(
+        median=median,
+        scale=scale,
+        low_percentile=_percentile(
+            raw_scores,
+            5,
+        ),
+        high_percentile=_percentile(
+            raw_scores,
+            95,
+        ),
+        threshold_raw=float(
+            threshold_raw
+        ),
+    )
+
+
+def raw_to_anomaly_score(
+    raw_score: float,
+    calibration: ScoreCalibration,
+) -> float:
+    """
+    Convert Isolation Forest's raw normality score into a
+    continuous anomaly score.
+
+    Isolation Forest:
+        higher raw score = more normal
+        lower raw score = more anomalous
+
+    Therefore:
+        median - raw_score
+    increases as the component becomes more anomalous.
+
+    The sigmoid keeps the output continuous and avoids the old
+    direct mapping that produced excessive 0/100 saturation.
+    """
+    raw_score = _safe_float(
+        raw_score
+    )
+
+    median = _safe_float(
+        calibration.median,
+        0.0,
+    )
+
+    scale = max(
+        _safe_float(
+            calibration.scale,
+            1.0,
+        ),
+        1e-9,
+    )
+
+    z = (
+        median
+        - raw_score
+    ) / scale
+
+    # Moderate the curve so normal components remain around the
+    # middle of the scale and abnormal components move upward
+    # progressively.
+    probability = _sigmoid(
+        z
+    )
+
+    score = (
+        probability
+        * 100.0
+    )
+
+    # Do not return exact 0 or 100.
+    score = _clip_float(
+        score,
+        1.0,
+        99.0,
+    )
+
+    return float(score)
 
 
 # ---------------------------------------------------------------------
-# Single parameter/type anomaly detector
+# Parameter anomaly detector
 # ---------------------------------------------------------------------
 
 class ParameterAnomalyDetector:
     """
-    Isolation Forest anomaly detector for one component-type /
-    parameter family.
-
-    Example:
-        Logic IC + Iddq
-        Memory IC + Standby Current
-        ADC + Leakage Current
-        Driver IC + Propagation Delay
+    Isolation Forest detector for one component_type /
+    parameter_name family.
     """
 
     def __init__(
         self,
+        component_type: Optional[str] = None,
+        parameter_name: Optional[str] = None,
         contamination: float = 0.10,
-        n_estimators: int = 300,
+        n_estimators: int = 400,
         random_state: int = 42,
-    ) -> None:
-        if not 0 < contamination < 0.5:
-            raise ValueError("contamination must be between 0 and 0.5")
+    ):
+        self.component_type = (
+            component_type
+        )
 
-        self.contamination = contamination
-        self.n_estimators = n_estimators
-        self.random_state = random_state
+        self.parameter_name = (
+            parameter_name
+        )
 
-        self.model: Optional[Pipeline] = None
-        self.is_fitted: bool = False
+        self.contamination = _clip_float(
+            contamination,
+            0.01,
+            0.49,
+        )
 
-        self.component_type: Optional[str] = None
-        self.parameter_name: Optional[str] = None
+        self.n_estimators = int(
+            max(
+                100,
+                n_estimators,
+            )
+        )
 
-        self.feature_names: List[str] = EARLY_FEATURES.copy()
+        self.random_state = int(
+            random_state
+        )
 
-        self.training_count: int = 0
-        self.training_anomaly_rate: Optional[float] = None
+        self.model: Optional[
+            IsolationForest
+        ] = None
+
+        self.feature_columns = list(
+            TRAJECTORY_FEATURES
+        )
+
+        self.calibration = (
+            ScoreCalibration()
+        )
+
+        self.training_rows = 0
+        self.core_training_rows = 0
+
+        self.fitted = False
+
+    # -----------------------------------------------------------------
+    # Matrix creation
+    # -----------------------------------------------------------------
+
+    def _matrix(
+        self,
+        feature_df: pd.DataFrame,
+    ) -> np.ndarray:
+        """
+        Convert feature dataframe into model matrix.
+        """
+        matrix = feature_df[
+            self.feature_columns
+        ].copy()
+
+        matrix = matrix.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        matrix = matrix.fillna(
+            0.0
+        )
+
+        matrix = matrix.astype(
+            float
+        )
+
+        return matrix.to_numpy(
+            dtype=np.float64
+        )
 
     # -----------------------------------------------------------------
     # Fit
@@ -105,265 +837,322 @@ class ParameterAnomalyDetector:
 
     def fit(
         self,
-        df: pd.DataFrame,
-        component_type: Optional[str] = None,
-        parameter_name: Optional[str] = None,
+        feature_df: pd.DataFrame,
     ) -> "ParameterAnomalyDetector":
         """
-        Train Isolation Forest on early-life features only.
+        Fit the detector without using ground-truth labels.
         """
-
-        missing = [c for c in self.feature_names if c not in df.columns]
-        if missing:
+        if feature_df.empty:
             raise ValueError(
-                f"Missing anomaly features: {missing}"
+                "Cannot train anomaly detector "
+                "with an empty dataframe."
             )
 
-        train_df = df.copy()
+        matrix = self._matrix(
+            feature_df
+        )
 
-        # Store family identifiers if supplied.
-        if component_type is not None:
-            self.component_type = str(component_type).strip()
+        self.training_rows = len(
+            feature_df
+        )
 
-        if parameter_name is not None:
-            self.parameter_name = str(parameter_name).strip()
+        # -------------------------------------------------------------
+        # Select a stable unsupervised core.
+        # -------------------------------------------------------------
 
-        # Keep only valid numeric rows.
-        X = train_df[self.feature_names].copy()
+        core_df = select_unsupervised_core(
+            feature_df
+        )
 
-        X = X.replace([np.inf, -np.inf], np.nan)
-        X = X.dropna()
+        core_matrix = self._matrix(
+            core_df
+        )
 
-        if len(X) < 20:
-            raise ValueError(
-                "Not enough valid rows to train anomaly detector. "
-                f"Found {len(X)}, need at least 20."
+        self.core_training_rows = len(
+            core_df
+        )
+
+        # -------------------------------------------------------------
+        # Train Isolation Forest.
+        # -------------------------------------------------------------
+
+        self.model = IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=self.random_state,
+            n_jobs=-1,
+            bootstrap=False,
+        )
+
+        self.model.fit(
+            core_matrix
+        )
+
+        # -------------------------------------------------------------
+        # Calibrate against the stable core.
+        # -------------------------------------------------------------
+
+        core_raw_scores = (
+            self.model.decision_function(
+                core_matrix
             )
-
-        # Isolation Forest becomes more stable with explicit scaling.
-        self.model = Pipeline(
-            steps=[
-                (
-                    "scaler",
-                    StandardScaler(),
-                ),
-                (
-                    "isolation_forest",
-                    IsolationForest(
-                        n_estimators=self.n_estimators,
-                        contamination=self.contamination,
-                        random_state=self.random_state,
-                        n_jobs=-1,
-                    ),
-                ),
-            ]
         )
 
-        self.model.fit(X)
-
-        predictions = self.model.predict(X)
-
-        self.training_count = len(X)
-        self.training_anomaly_rate = float(
-            np.mean(predictions == -1)
+        # The model's own prediction threshold is retained as the
+        # binary anomaly boundary.
+        threshold_raw = (
+            _safe_float(
+                getattr(
+                    self.model,
+                    "offset_",
+                    0.0,
+                ),
+                0.0,
+            )
         )
 
-        self.is_fitted = True
+        self.calibration = (
+            fit_score_calibration(
+                core_raw_scores,
+                threshold_raw,
+            )
+        )
+
+        self.fitted = True
 
         return self
 
     # -----------------------------------------------------------------
-    # Validation
+    # Raw prediction
     # -----------------------------------------------------------------
 
-    def _check_fitted(self) -> None:
-        if not self.is_fitted or self.model is None:
+    def predict_raw(
+        self,
+        feature_df: pd.DataFrame,
+    ) -> np.ndarray:
+        """
+        Return Isolation Forest raw normality scores.
+        """
+        if not self.fitted or self.model is None:
             raise RuntimeError(
-                "Anomaly detector is not fitted. "
-                "Call fit() or load a trained model first."
+                "Anomaly detector has not been fitted."
             )
 
-    def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        missing = [c for c in self.feature_names if c not in df.columns]
+        matrix = self._matrix(
+            feature_df
+        )
 
-        if missing:
-            raise ValueError(
-                f"Missing anomaly features: {missing}"
+        return self.model.decision_function(
+            matrix
+        )
+
+    # -----------------------------------------------------------------
+    # Continuous anomaly score
+    # -----------------------------------------------------------------
+
+    def predict_score(
+        self,
+        feature_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Return continuous anomaly scores.
+        """
+        if not self.fitted or self.model is None:
+            raise RuntimeError(
+                "Anomaly detector has not been fitted."
             )
 
-        X = df[self.feature_names].copy()
+        raw_scores = self.predict_raw(
+            feature_df
+        )
 
-        X = X.replace([np.inf, -np.inf], np.nan)
+        flags = self.model.predict(
+            self._matrix(
+                feature_df
+            )
+        )
 
-        # Fill missing numeric values using feature medians.
-        for column in self.feature_names:
-            if X[column].isna().any():
-                median_value = X[column].median()
+        anomaly_indices = np.array(
+            [
+                raw_to_anomaly_score(
+                    raw,
+                    self.calibration,
+                )
+                for raw in raw_scores
+            ],
+            dtype=float,
+        )
 
-                if pd.isna(median_value):
-                    median_value = 0.0
+        return pd.DataFrame(
+            {
+                "anomaly_flag": (
+                    flags == -1
+                ).astype(int),
 
-                X[column] = X[column].fillna(median_value)
+                "anomaly_score": (
+                    anomaly_indices
+                ),
 
-        return X
+                "anomaly_index": (
+                    anomaly_indices
+                ),
 
-    # -----------------------------------------------------------------
-    # Predict
-    # -----------------------------------------------------------------
-
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Returns:
-            1  = normal
-           -1  = anomaly
-        """
-
-        self._check_fitted()
-
-        X = self._prepare_features(df)
-
-        return self.model.predict(X)
-
-    def predict_score(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Returns Isolation Forest decision-function scores.
-
-        Higher = more normal.
-        Lower  = more anomalous.
-        """
-
-        self._check_fitted()
-
-        X = self._prepare_features(df)
-
-        return self.model.decision_function(X)
-
-    def anomaly_index(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Converts Isolation Forest scores into a 0-100 anomaly index.
-
-        Higher = more anomalous.
-
-        This is NOT a probability.
-        """
-
-        raw_scores = self.predict_score(df)
-
-        # IsolationForest decision_function is generally centered around
-        # zero. Convert it to a bounded anomaly-like index.
-        #
-        # Negative scores -> increasing anomaly index
-        # Positive scores -> decreasing anomaly index
-        index = 50.0 - (raw_scores * 100.0)
-
-        index = np.clip(index, 0.0, 100.0)
-
-        return index
+                "anomaly_raw_score": (
+                    raw_scores
+                ),
+            },
+            index=feature_df.index,
+        )
 
     # -----------------------------------------------------------------
-    # Component-level result
+    # Full analysis
     # -----------------------------------------------------------------
 
     def analyze(
         self,
-        df: pd.DataFrame,
+        feature_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Add anomaly prediction fields to a dataframe.
+        Analyze trajectories and return the original feature data
+        plus anomaly outputs.
         """
+        result = feature_df.copy()
 
-        result = df.copy()
+        scores = self.predict_score(
+            feature_df
+        )
 
-        predictions = self.predict(result)
-        raw_scores = self.predict_score(result)
-        indices = self.anomaly_index(result)
+        for column in scores.columns:
+            result[column] = scores[
+                column
+            ]
 
-        result["anomaly_flag"] = (predictions == -1).astype(int)
         result["anomaly_label"] = np.where(
-            predictions == -1,
+            result["anomaly_flag"] == 1,
             "ANOMALY",
             "NORMAL",
         )
-        result["anomaly_raw_score"] = raw_scores
-        result["anomaly_index"] = indices
+
+        # Rounded display-friendly fields.
+        result["anomaly_score"] = (
+            result["anomaly_score"]
+            .astype(float)
+            .round(4)
+        )
+
+        result["anomaly_index"] = (
+            result["anomaly_index"]
+            .astype(float)
+            .round(4)
+        )
 
         return result
 
     # -----------------------------------------------------------------
-    # Save / load
+    # Serialization
     # -----------------------------------------------------------------
 
-    def save(self, path: str | Path) -> None:
-        self._check_fitted()
-
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        payload = {
-            "model": self.model,
+    def to_dict(
+        self,
+    ) -> Dict[str, Any]:
+        """
+        Serialize detector metadata.
+        """
+        return {
+            "component_type": self.component_type,
+            "parameter_name": self.parameter_name,
             "contamination": self.contamination,
             "n_estimators": self.n_estimators,
             "random_state": self.random_state,
-            "component_type": self.component_type,
-            "parameter_name": self.parameter_name,
-            "feature_names": self.feature_names,
-            "training_count": self.training_count,
-            "training_anomaly_rate": self.training_anomaly_rate,
+            "feature_columns": list(
+                self.feature_columns
+            ),
+            "calibration": (
+                self.calibration.to_dict()
+            ),
+            "training_rows": (
+                self.training_rows
+            ),
+            "core_training_rows": (
+                self.core_training_rows
+            ),
+            "fitted": self.fitted,
+            "model": self.model,
         }
 
-        joblib.dump(payload, path)
-
     @classmethod
-    def load(cls, path: str | Path) -> "ParameterAnomalyDetector":
-        path = Path(path)
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Anomaly model not found: {path}"
-            )
-
-        payload = joblib.load(path)
-
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+    ) -> "ParameterAnomalyDetector":
+        """
+        Restore detector from serialized dictionary.
+        """
         detector = cls(
-            contamination=payload.get(
-                "contamination",
+            component_type=data.get(
+                "component_type"
+            ),
+            parameter_name=data.get(
+                "parameter_name"
+            ),
+            contamination=_safe_float(
+                data.get(
+                    "contamination",
+                    0.10,
+                ),
                 0.10,
             ),
-            n_estimators=payload.get(
-                "n_estimators",
-                300,
+            n_estimators=int(
+                data.get(
+                    "n_estimators",
+                    400,
+                )
             ),
-            random_state=payload.get(
-                "random_state",
-                42,
+            random_state=int(
+                data.get(
+                    "random_state",
+                    42,
+                )
             ),
         )
 
-        detector.model = payload["model"]
-
-        detector.component_type = payload.get(
-            "component_type"
+        detector.feature_columns = list(
+            data.get(
+                "feature_columns",
+                TRAJECTORY_FEATURES,
+            )
         )
 
-        detector.parameter_name = payload.get(
-            "parameter_name"
+        detector.calibration = (
+            ScoreCalibration.from_dict(
+                data.get(
+                    "calibration",
+                    {},
+                )
+            )
         )
 
-        detector.feature_names = payload.get(
-            "feature_names",
-            EARLY_FEATURES.copy(),
+        detector.training_rows = int(
+            data.get(
+                "training_rows",
+                0,
+            )
         )
 
-        detector.training_count = payload.get(
-            "training_count",
-            0,
+        detector.core_training_rows = int(
+            data.get(
+                "core_training_rows",
+                0,
+            )
         )
 
-        detector.training_anomaly_rate = payload.get(
-            "training_anomaly_rate"
+        detector.model = data.get(
+            "model"
         )
 
-        detector.is_fitted = True
+        detector.fitted = (
+            detector.model is not None
+        )
 
         return detector
 
@@ -374,122 +1163,67 @@ class ParameterAnomalyDetector:
 
 class ParameterModelRegistry:
     """
-    Stores one anomaly model per component-type / parameter family.
+    Registry containing one anomaly detector per component family.
 
-    Example keys:
-        Logic IC__Iddq
-        Memory IC__Standby Current
-        ADC__Leakage Current
-        Driver IC__Propagation Delay
+    Example groups:
+
+        Logic IC / Iddq
+        Memory IC / Standby Current
+        ADC / Leakage Current
+        Driver IC / Propagation Delay
     """
 
-    def __init__(self) -> None:
-        self.models: Dict[str, ParameterAnomalyDetector] = {}
+    VERSION = 5
+
+    def __init__(self):
+        self.models: Dict[
+            Tuple[str, str],
+            ParameterAnomalyDetector,
+        ] = {}
 
     # -----------------------------------------------------------------
-    # Key handling
+    # Group key
     # -----------------------------------------------------------------
 
     @staticmethod
-    def make_key(
-        component_type: str,
-        parameter_name: str,
-    ) -> str:
-        """
-        Create one canonical model key.
-
-        Whitespace is normalized so training and inference produce
-        exactly the same key.
-        """
-
-        component_type = str(component_type).strip()
-        parameter_name = str(parameter_name).strip()
-
-        return f"{component_type}__{parameter_name}"
-
-    # -----------------------------------------------------------------
-    # Add / get
-    # -----------------------------------------------------------------
-
-    def add(
-        self,
-        component_type: str,
-        parameter_name: str,
-        detector: ParameterAnomalyDetector,
-    ) -> None:
-        key = self.make_key(
-            component_type,
-            parameter_name,
-        )
-
-        self.models[key] = detector
-
-    def get(
-        self,
-        component_type: str,
-        parameter_name: str,
-    ) -> ParameterAnomalyDetector:
-        key = self.make_key(
-            component_type,
-            parameter_name,
-        )
-
-        # Exact lookup first.
-        if key in self.models:
-            return self.models[key]
-
-        # Extra defensive lookup in case an old model dictionary contains
-        # accidental whitespace.
-        normalized_key = self.make_key(
-            component_type.strip(),
-            parameter_name.strip(),
-        )
-
-        if normalized_key in self.models:
-            return self.models[normalized_key]
-
-        available = ", ".join(sorted(self.models.keys()))
-
-        raise KeyError(
-            f"No anomaly model available for {key}. "
-            f"Available models: {available}"
+    def _key(
+        component_type: Any,
+        parameter_name: Any,
+    ) -> Tuple[str, str]:
+        return (
+            str(component_type),
+            str(parameter_name),
         )
 
     # -----------------------------------------------------------------
-    # Fit all families
+    # Fit all groups
     # -----------------------------------------------------------------
 
     def fit_all(
         self,
         df: pd.DataFrame,
         contamination: float = 0.10,
-        n_estimators: int = 300,
+        n_estimators: int = 400,
         random_state: int = 42,
+        verbose: bool = True,
     ) -> "ParameterModelRegistry":
         """
-        Train one anomaly model per component_type + parameter_name.
+        Train one detector per component family.
+
+        No defect labels are accessed.
         """
+        validate_dataset(
+            df
+        )
 
-        required = [
-            "component_type",
-            "parameter_name",
-            *EARLY_FEATURES,
-        ]
-
-        missing = [
-            c for c in required
-            if c not in df.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Missing columns for anomaly training: {missing}"
-            )
+        features = create_anomaly_features(
+            df
+        )
 
         self.models = {}
 
-        grouped = df.groupby(
-            ["component_type", "parameter_name"],
+        grouped = features.groupby(
+            GROUP_COLUMNS,
             dropna=False,
         )
 
@@ -498,395 +1232,617 @@ class ParameterModelRegistry:
             parameter_name,
         ), group in grouped:
 
-            component_type = str(component_type).strip()
-            parameter_name = str(parameter_name).strip()
+            key = self._key(
+                component_type,
+                parameter_name,
+            )
 
-            if not component_type or not parameter_name:
-                continue
-
-            detector = ParameterAnomalyDetector(
-                contamination=contamination,
-                n_estimators=n_estimators,
-                random_state=random_state,
+            detector = (
+                ParameterAnomalyDetector(
+                    component_type=str(
+                        component_type
+                    ),
+                    parameter_name=str(
+                        parameter_name
+                    ),
+                    contamination=contamination,
+                    n_estimators=n_estimators,
+                    random_state=random_state,
+                )
             )
 
             detector.fit(
-                group,
-                component_type=component_type,
-                parameter_name=parameter_name,
+                group
             )
 
-            self.add(
-                component_type,
-                parameter_name,
-                detector,
+            self.models[key] = (
+                detector
             )
 
-        if not self.models:
-            raise ValueError(
-                "No anomaly models were trained."
-            )
+            if verbose:
+                print(
+                    "Trained anomaly model:",
+                    f"{component_type} / "
+                    f"{parameter_name}",
+                    f"| rows={len(group)}",
+                    f"| core={detector.core_training_rows}",
+                )
 
         return self
 
     # -----------------------------------------------------------------
-    # Predict one component
+    # Get model
     # -----------------------------------------------------------------
 
-    def predict_component(
+    def get_model(
         self,
-        row: pd.Series | Dict,
-    ) -> AnomalyResult:
+        component_type: str,
+        parameter_name: str,
+    ) -> Optional[
+        ParameterAnomalyDetector
+    ]:
         """
-        Analyze one component record.
+        Retrieve detector for a component family.
         """
-
-        if isinstance(row, pd.Series):
-            record = row.to_dict()
-        else:
-            record = dict(row)
-
-        component_type = str(
-            record.get("component_type", "")
-        ).strip()
-
-        parameter_name = str(
-            record.get("parameter_name", "")
-        ).strip()
-
-        if not component_type:
-            raise ValueError(
-                "component_type is required."
-            )
-
-        if not parameter_name:
-            raise ValueError(
-                "parameter_name is required."
-            )
-
-        detector = self.get(
+        key = self._key(
             component_type,
             parameter_name,
         )
 
-        single_df = pd.DataFrame([record])
-
-        prediction = detector.predict(single_df)[0]
-        raw_score = detector.predict_score(single_df)[0]
-        anomaly_index = detector.anomaly_index(single_df)[0]
-
-        return AnomalyResult(
-            is_anomaly=bool(prediction == -1),
-            anomaly_score=float(anomaly_index),
-            raw_score=float(raw_score),
-            parameter_name=parameter_name,
-            component_type=component_type,
+        return self.models.get(
+            key
         )
 
     # -----------------------------------------------------------------
-    # Analyze dataframe
+    # Analyze one dataframe
     # -----------------------------------------------------------------
 
-    def analyze_dataframe(
+    def analyze(
         self,
         df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Apply the correct parameter-specific anomaly detector to every
-        row in the dataframe.
+        Analyze all component groups.
         """
+        if df.empty:
+            return df.copy()
 
-        required = [
-            "component_type",
-            "parameter_name",
-            *EARLY_FEATURES,
-        ]
-
-        missing = [
-            c for c in required
-            if c not in df.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Missing columns for anomaly analysis: {missing}"
-            )
-
-        result = df.copy()
-
-        result["anomaly_flag"] = 0
-        result["anomaly_label"] = "NORMAL"
-        result["anomaly_raw_score"] = np.nan
-        result["anomaly_index"] = np.nan
-
-        # Process each family with its matching model.
-        grouped = result.groupby(
-            ["component_type", "parameter_name"],
-            dropna=False,
+        validate_dataset(
+            df
         )
+
+        features = create_anomaly_features(
+            df
+        )
+
+        outputs: List[
+            pd.DataFrame
+        ] = []
 
         for (
             component_type,
             parameter_name,
-        ), indices in grouped.groups.items():
-
-            component_type = str(component_type).strip()
-            parameter_name = str(parameter_name).strip()
-
-            detector = self.get(
+        ), group in features.groupby(
+            GROUP_COLUMNS,
+            dropna=False,
+        ):
+            key = self._key(
                 component_type,
                 parameter_name,
             )
 
-            family_df = result.loc[
-                indices
-            ].copy()
-
-            family_result = detector.analyze(
-                family_df
+            detector = self.models.get(
+                key
             )
 
-            result.loc[
-                indices,
-                "anomaly_flag"
-            ] = family_result[
-                "anomaly_flag"
-            ].values
+            if detector is None:
+                raise KeyError(
+                    "No anomaly model exists for "
+                    f"{component_type} / "
+                    f"{parameter_name}"
+                )
 
-            result.loc[
-                indices,
-                "anomaly_label"
-            ] = family_result[
-                "anomaly_label"
-            ].values
-
-            result.loc[
-                indices,
-                "anomaly_raw_score"
-            ] = family_result[
-                "anomaly_raw_score"
-            ].values
-
-            result.loc[
-                indices,
-                "anomaly_index"
-            ] = family_result[
-                "anomaly_index"
-            ].values
-
-        result["anomaly_flag"] = (
-            result["anomaly_flag"]
-            .fillna(0)
-            .astype(int)
-        )
-
-        result["anomaly_index"] = (
-            result["anomaly_index"]
-            .fillna(0.0)
-            .astype(float)
-        )
-
-        return result
-
-    # Alias useful for backend code.
-    analyze = analyze_dataframe
-
-    # -----------------------------------------------------------------
-    # Registry info
-    # -----------------------------------------------------------------
-
-    def available_models(self) -> List[str]:
-        return sorted(self.models.keys())
-
-    def summary(self) -> pd.DataFrame:
-        """
-        Return model metadata.
-        """
-
-        rows = []
-
-        for key, detector in self.models.items():
-            rows.append(
-                {
-                    "model_key": key,
-                    "component_type": detector.component_type,
-                    "parameter_name": detector.parameter_name,
-                    "contamination": detector.contamination,
-                    "n_estimators": detector.n_estimators,
-                    "training_count": detector.training_count,
-                    "training_anomaly_rate": (
-                        detector.training_anomaly_rate
-                    ),
-                }
+            analyzed = detector.analyze(
+                group
             )
 
-        return pd.DataFrame(rows)
+            outputs.append(
+                analyzed
+            )
+
+        if not outputs:
+            return features.copy()
+
+        result = pd.concat(
+            outputs,
+            axis=0,
+        )
+
+        return result.sort_index()
 
     # -----------------------------------------------------------------
-    # Save registry
+    # Analyze one component
+    # -----------------------------------------------------------------
+
+    def analyze_component(
+        self,
+        row: pd.DataFrame | Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Analyze one component trajectory.
+
+        Accepts either a one-row dataframe or a dictionary.
+        """
+        if isinstance(
+            row,
+            dict,
+        ):
+            input_df = pd.DataFrame(
+                [row]
+            )
+        else:
+            input_df = row.copy()
+
+        if input_df.empty:
+            raise ValueError(
+                "Component data is empty."
+            )
+
+        validate_dataset(
+            input_df
+        )
+
+        result = self.analyze(
+            input_df
+        )
+
+        if result.empty:
+            raise ValueError(
+                "No anomaly result generated."
+            )
+
+        return result.iloc[
+            0
+        ].to_dict()
+
+    # -----------------------------------------------------------------
+    # Save
     # -----------------------------------------------------------------
 
     def save(
         self,
-        directory: str | Path,
-    ) -> None:
+        path: str | os.PathLike[str],
+    ) -> str:
         """
-        Save every parameter-specific model as a separate .joblib file.
-
-        IMPORTANT:
-        Spaces in parameter names are preserved.
-        Only path separators are replaced because they would break
-        filenames.
+        Save the entire registry to a pickle file.
         """
+        output_path = Path(
+            path
+        )
 
-        directory = Path(directory)
-        directory.mkdir(
+        output_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        # Save a registry summary too.
-        metadata_rows = []
+        payload = {
+            "version": self.VERSION,
+            "models": self.models,
+        }
 
-        for key, detector in self.models.items():
-
-            safe_name = key.replace(
-                "/",
-                "_",
-            ).replace(
-                "\\",
-                "_",
+        with open(
+            output_path,
+            "wb",
+        ) as handle:
+            pickle.dump(
+                payload,
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
             )
 
-            model_path = directory / (
-                f"{safe_name}.joblib"
-            )
-
-            detector.save(model_path)
-
-            metadata_rows.append(
-                {
-                    "model_key": key,
-                    "filename": model_path.name,
-                    "component_type": (
-                        detector.component_type
-                    ),
-                    "parameter_name": (
-                        detector.parameter_name
-                    ),
-                }
-            )
-
-        metadata = pd.DataFrame(
-            metadata_rows
-        )
-
-        metadata.to_csv(
-            directory / "registry.csv",
-            index=False,
+        return str(
+            output_path
         )
 
     # -----------------------------------------------------------------
-    # Load registry
+    # Load
     # -----------------------------------------------------------------
 
     @classmethod
     def load(
         cls,
-        directory: str | Path,
+        path: str | os.PathLike[str],
     ) -> "ParameterModelRegistry":
         """
-        Load all .joblib parameter-specific anomaly models.
+        Load a saved model registry.
         """
+        model_path = Path(
+            path
+        )
 
-        directory = Path(directory)
-
-        if not directory.exists():
+        if not model_path.exists():
             raise FileNotFoundError(
-                f"Anomaly model directory not found: {directory}"
+                f"Anomaly model registry not found: "
+                f"{model_path}"
+            )
+
+        with open(
+            model_path,
+            "rb",
+        ) as handle:
+            payload = pickle.load(
+                handle
             )
 
         registry = cls()
 
-        model_files = sorted(
-            directory.glob("*.joblib")
+        # -------------------------------------------------------------
+        # Current registry format
+        # -------------------------------------------------------------
+
+        if isinstance(
+            payload,
+            dict,
+        ) and "models" in payload:
+
+            models = payload.get(
+                "models",
+                {},
+            )
+
+            for key, detector in models.items():
+
+                if isinstance(
+                    detector,
+                    ParameterAnomalyDetector,
+                ):
+                    registry.models[
+                        tuple(key)
+                    ] = detector
+
+                elif isinstance(
+                    detector,
+                    dict,
+                ):
+                    registry.models[
+                        tuple(key)
+                    ] = (
+                        ParameterAnomalyDetector
+                        .from_dict(
+                            detector
+                        )
+                    )
+
+            return registry
+
+        # -------------------------------------------------------------
+        # Backward compatibility:
+        # dictionary directly containing models
+        # -------------------------------------------------------------
+
+        if isinstance(
+            payload,
+            dict,
+        ):
+            for key, detector in payload.items():
+
+                if isinstance(
+                    key,
+                    tuple,
+                ) and len(key) == 2:
+
+                    if isinstance(
+                        detector,
+                        ParameterAnomalyDetector,
+                    ):
+                        registry.models[
+                            tuple(key)
+                        ] = detector
+
+                    elif isinstance(
+                        detector,
+                        dict,
+                    ):
+                        registry.models[
+                            tuple(key)
+                        ] = (
+                            ParameterAnomalyDetector
+                            .from_dict(
+                                detector
+                            )
+                        )
+
+            if registry.models:
+                return registry
+
+        raise ValueError(
+            "Unsupported anomaly model registry format."
         )
 
-        if not model_files:
-            raise FileNotFoundError(
-                f"No anomaly .joblib models found in {directory}"
+    # -----------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------
+
+    def summary(self) -> pd.DataFrame:
+        """
+        Return a compact model registry summary.
+        """
+        rows = []
+
+        for (
+            component_type,
+            parameter_name,
+        ), detector in sorted(
+            self.models.items()
+        ):
+            rows.append(
+                {
+                    "component_type": component_type,
+                    "parameter_name": parameter_name,
+                    "training_rows": (
+                        detector.training_rows
+                    ),
+                    "core_training_rows": (
+                        detector.core_training_rows
+                    ),
+                    "contamination": (
+                        detector.contamination
+                    ),
+                    "n_estimators": (
+                        detector.n_estimators
+                    ),
+                    "score_median": (
+                        detector.calibration.median
+                    ),
+                    "score_scale": (
+                        detector.calibration.scale
+                    ),
+                    "threshold_raw": (
+                        detector.calibration.threshold_raw
+                    ),
+                    "fitted": (
+                        detector.fitted
+                    ),
+                }
             )
 
-        for model_path in model_files:
-
-            detector = ParameterAnomalyDetector.load(
-                model_path
-            )
-
-            component_type = (
-                detector.component_type
-            )
-            parameter_name = (
-                detector.parameter_name
-            )
-
-            if not component_type or not parameter_name:
-                raise ValueError(
-                    f"Model metadata missing in {model_path}"
-                )
-
-            registry.add(
-                component_type,
-                parameter_name,
-                detector,
-            )
-
-        return registry
+        return pd.DataFrame(
+            rows
+        )
 
 
 # ---------------------------------------------------------------------
-# Convenience functions
+# Public training API
 # ---------------------------------------------------------------------
 
 def train_anomaly_models(
-    df: pd.DataFrame,
-    output_dir: str | Path = "models/anomaly",
+    dataset_path: str | os.PathLike[str] = DEFAULT_DATASET_PATH,
+    model_path: str | os.PathLike[str] = DEFAULT_MODEL_PATH,
     contamination: float = 0.10,
-    n_estimators: int = 300,
+    n_estimators: int = 400,
     random_state: int = 42,
+    verbose: bool = True,
 ) -> ParameterModelRegistry:
     """
-    Train and save all parameter-specific anomaly models.
+    Train and save the complete anomaly model registry.
     """
-
-    registry = ParameterModelRegistry()
-
-    registry.fit_all(
-        df=df,
-        contamination=contamination,
-        n_estimators=n_estimators,
-        random_state=random_state,
+    dataset_path = Path(
+        dataset_path
     )
 
-    registry.save(output_dir)
+    model_path = Path(
+        model_path
+    )
+
+    print()
+    print("=" * 70)
+    print("AEGISBURN AI - ANOMALY MODEL TRAINING")
+    print("=" * 70)
+    print(
+        "Dataset:",
+        dataset_path,
+    )
+
+    df = load_dataset(
+        dataset_path
+    )
+
+    print(
+        "Rows loaded:",
+        len(df),
+    )
+
+    print(
+        "Columns:",
+        list(df.columns),
+    )
+
+    # Explicitly report that labels are not being used.
+    print(
+        "Training mode: UNSUPERVISED"
+    )
+
+    print(
+        "Ground-truth labels used: NO"
+    )
+
+    print(
+        "168h measurement used by anomaly detector: NO"
+    )
+
+    registry = (
+        ParameterModelRegistry()
+        .fit_all(
+            df,
+            contamination=contamination,
+            n_estimators=n_estimators,
+            random_state=random_state,
+            verbose=verbose,
+        )
+    )
+
+    saved_path = registry.save(
+        model_path
+    )
+
+    print()
+    print(
+        "Anomaly model registry saved to:",
+        saved_path,
+    )
+
+    print()
+    print(
+        registry.summary().to_string(
+            index=False
+        )
+    )
+
+    print()
+    print("=" * 70)
+    print("ANOMALY TRAINING COMPLETE")
+    print("=" * 70)
+    print()
 
     return registry
 
 
+# ---------------------------------------------------------------------
+# Public loading API
+# ---------------------------------------------------------------------
+
 def load_anomaly_models(
-    model_dir: str | Path = "models/anomaly",
+    model_path: str | os.PathLike[str] = DEFAULT_MODEL_PATH,
 ) -> ParameterModelRegistry:
     """
-    Load saved parameter-specific anomaly models.
+    Load the consolidated anomaly model registry.
     """
-
-    return ParameterModelRegistry.load(model_dir)
+    return ParameterModelRegistry.load(
+        model_path
+    )
 
 
 # ---------------------------------------------------------------------
-# Simple standalone test
+# Convenience prediction API
 # ---------------------------------------------------------------------
+
+def analyze_dataframe(
+    df: pd.DataFrame,
+    registry: ParameterModelRegistry,
+) -> pd.DataFrame:
+    """
+    Analyze a dataframe with an already-loaded registry.
+    """
+    return registry.analyze(
+        df
+    )
+
+
+def analyze_component(
+    component: Dict[str, Any],
+    registry: ParameterModelRegistry,
+) -> Dict[str, Any]:
+    """
+    Analyze one component dictionary.
+    """
+    return registry.analyze_component(
+        component
+    )
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """
+    Build command-line argument parser.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train AegisBurn AI unsupervised "
+            "burn-in anomaly detection models."
+        )
+    )
+
+    parser.add_argument(
+        "--data",
+        default=str(
+            DEFAULT_DATASET_PATH
+        ),
+        help=(
+            "Path to component_data.csv"
+        ),
+    )
+
+    parser.add_argument(
+        "--model",
+        default=str(
+            DEFAULT_MODEL_PATH
+        ),
+        help=(
+            "Output anomaly_models.pkl path"
+        ),
+    )
+
+    parser.add_argument(
+        "--contamination",
+        type=float,
+        default=0.10,
+        help=(
+            "Isolation Forest contamination "
+            "parameter."
+        ),
+    )
+
+    parser.add_argument(
+        "--estimators",
+        type=int,
+        default=400,
+        help=(
+            "Number of Isolation Forest trees."
+        ),
+    )
+
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help=(
+            "Random seed."
+        ),
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Reduce training output."
+        ),
+    )
+
+    return parser
+
+
+def main() -> None:
+    """
+    CLI entry point.
+    """
+    parser = (
+        build_argument_parser()
+    )
+
+    args = parser.parse_args()
+
+    train_anomaly_models(
+        dataset_path=args.data,
+        model_path=args.model,
+        contamination=args.contamination,
+        n_estimators=args.estimators,
+        random_state=args.random_state,
+        verbose=not args.quiet,
+    )
+
 
 if __name__ == "__main__":
-    print("Parameter anomaly detection module loaded successfully.")
-    print(f"Early features: {EARLY_FEATURES}")
+    main()

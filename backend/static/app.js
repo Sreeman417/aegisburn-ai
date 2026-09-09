@@ -1,7 +1,8 @@
 "use strict";
 
 /* ============================================================
-   AEGISBURN AI — FRONTEND APPLICATION
+   AEGISBURN AI
+   FRONTEND APPLICATION
    ============================================================ */
 
 const API_BASE = window.location.origin;
@@ -9,7 +10,8 @@ const API_BASE = window.location.origin;
 const state = {
     components: [],
     selectedComponentId: null,
-    selectedResult: null
+    selectedResult: null,
+    chart: null
 };
 
 
@@ -44,10 +46,18 @@ function setHTML(id, value) {
     element.innerHTML = value;
 }
 
-function formatNumber(value, decimals = 2) {
+function numberValue(value) {
     const number = Number(value);
 
-    if (!Number.isFinite(number)) {
+    return Number.isFinite(number)
+        ? number
+        : null;
+}
+
+function formatNumber(value, decimals = 2) {
+    const number = numberValue(value);
+
+    if (number === null) {
         return "—";
     }
 
@@ -57,14 +67,14 @@ function formatNumber(value, decimals = 2) {
     });
 }
 
-function formatValue(value, unit = "") {
-    const number = Number(value);
+function formatValue(value, unit = "", decimals = 2) {
+    const number = numberValue(value);
 
-    if (!Number.isFinite(number)) {
+    if (number === null) {
         return "—";
     }
 
-    return `${formatNumber(number)}${unit ? ` ${unit}` : ""}`;
+    return `${formatNumber(number, decimals)}${unit ? ` ${unit}` : ""}`;
 }
 
 function escapeHTML(value) {
@@ -82,27 +92,43 @@ function escapeHTML(value) {
 
 
 /* ============================================================
-   RISK HELPERS
+   RISK NORMALIZATION
    ============================================================ */
 
 function normalizeRisk(value) {
-    if (!value) {
+    if (value === undefined || value === null || value === "") {
         return "REVIEW";
     }
 
-    const risk = String(value).toUpperCase();
+    const risk = String(value)
+        .trim()
+        .toUpperCase();
 
     if (
-        risk.includes("HIGH") ||
-        risk.includes("CRITICAL")
+        risk.includes("CRITICAL") ||
+        risk === "CRIT"
+    ) {
+        return "CRITICAL";
+    }
+
+    if (
+        risk.includes("HIGH RISK") ||
+        risk === "HIGH" ||
+        risk.includes("HIGH")
     ) {
         return "HIGH RISK";
     }
 
     if (
+        risk.includes("MEDIUM") ||
+        risk.includes("REVIEW")
+    ) {
+        return "REVIEW";
+    }
+
+    if (
         risk.includes("NORMAL") ||
-        risk.includes("LOW") ||
-        risk.includes("SAFE")
+        risk.includes("LOW")
     ) {
         return "NORMAL";
     }
@@ -110,8 +136,13 @@ function normalizeRisk(value) {
     return "REVIEW";
 }
 
+
 function riskClass(risk) {
     const normalized = normalizeRisk(risk);
+
+    if (normalized === "CRITICAL") {
+        return "critical";
+    }
 
     if (normalized === "HIGH RISK") {
         return "high-risk";
@@ -125,29 +156,68 @@ function riskClass(risk) {
 }
 
 
+function riskColors(risk) {
+    const normalized = normalizeRisk(risk);
+
+    if (normalized === "CRITICAL") {
+        return {
+            color: "#ff4d57",
+            background: "rgba(255, 77, 87, 0.10)",
+            border: "#ff4d57"
+        };
+    }
+
+    if (normalized === "HIGH RISK") {
+        return {
+            color: "#ff7a18",
+            background: "rgba(255, 122, 24, 0.10)",
+            border: "#ff7a18"
+        };
+    }
+
+    if (normalized === "NORMAL") {
+        return {
+            color: "#20c66b",
+            background: "rgba(32, 198, 107, 0.10)",
+            border: "#20c66b"
+        };
+    }
+
+    return {
+        color: "#f5b942",
+        background: "rgba(245, 185, 66, 0.10)",
+        border: "#f5b942"
+    };
+}
+
+
 /* ============================================================
-   API REQUEST
+   API
    ============================================================ */
 
 async function apiRequest(path, options = {}) {
-    const requestOptions = {
+
+    const fetchOptions = {
         method: options.method || "GET",
         headers: {
+            ...(options.body
+                ? {
+                    "Content-Type": "application/json"
+                }
+                : {}),
             ...(options.headers || {})
         }
     };
 
     if (options.body !== undefined) {
-        requestOptions.headers["Content-Type"] =
-            "application/json";
-
-        requestOptions.body =
-            JSON.stringify(options.body);
+        fetchOptions.body = JSON.stringify(
+            options.body
+        );
     }
 
     const response = await fetch(
         `${API_BASE}${path}`,
-        requestOptions
+        fetchOptions
     );
 
     const contentType =
@@ -155,10 +225,16 @@ async function apiRequest(path, options = {}) {
 
     let data;
 
-    if (contentType.includes("application/json")) {
+    if (
+        contentType.includes(
+            "application/json"
+        )
+    ) {
         data = await response.json();
     } else {
-        const text = await response.text();
+
+        const text =
+            await response.text();
 
         try {
             data = JSON.parse(text);
@@ -170,6 +246,7 @@ async function apiRequest(path, options = {}) {
     }
 
     if (!response.ok) {
+
         const message =
             data?.detail ||
             data?.message ||
@@ -187,101 +264,11 @@ async function apiRequest(path, options = {}) {
 
 
 /* ============================================================
-   CONNECTION STATUS
-   ============================================================ */
-
-function getConnectionElement() {
-    return (
-        $("connectionText") ||
-        $("connectionStatus") ||
-        $("systemStatus")
-    );
-}
-
-function getConnectionDot() {
-    return $("connectionDot") || $("statusDot");
-}
-
-function setConnectionState(
-    stateName,
-    text
-) {
-    const textElement =
-        getConnectionElement();
-
-    const dotElement =
-        getConnectionDot();
-
-    if (textElement) {
-        textElement.textContent = text;
-
-        textElement.classList.remove(
-            "online",
-            "offline",
-            "connecting"
-        );
-
-        textElement.classList.add(
-            stateName
-        );
-    }
-
-    if (dotElement) {
-        dotElement.classList.remove(
-            "online",
-            "offline",
-            "connecting"
-        );
-
-        dotElement.classList.add(
-            stateName
-        );
-    }
-}
-
-async function checkConnection() {
-    try {
-        const health =
-            await apiRequest("/health");
-
-        if (
-            health &&
-            health.status === "healthy"
-        ) {
-            setConnectionState(
-                "online",
-                "System Online"
-            );
-        } else {
-            setConnectionState(
-                "online",
-                "System Ready"
-            );
-        }
-
-        return true;
-
-    } catch (error) {
-        console.error(
-            "Backend connection failed:",
-            error
-        );
-
-        setConnectionState(
-            "offline",
-            "Backend Offline"
-        );
-
-        return false;
-    }
-}
-
-
-/* ============================================================
    RESPONSE NORMALIZATION
    ============================================================ */
 
 function extractComponents(data) {
+
     if (Array.isArray(data)) {
         return data;
     }
@@ -301,20 +288,32 @@ function extractComponents(data) {
     return [];
 }
 
+
 function extractAnalysis(data) {
+
     if (!data) {
         return {};
     }
 
-    if (data.result) {
+    if (
+        data.result &&
+        typeof data.result === "object"
+    ) {
         return data.result;
     }
 
-    if (data.analysis) {
+    if (
+        data.analysis &&
+        typeof data.analysis === "object"
+    ) {
         return data.analysis;
     }
 
-    if (data.data) {
+    if (
+        data.data &&
+        typeof data.data === "object" &&
+        !Array.isArray(data.data)
+    ) {
         return data.data;
     }
 
@@ -323,58 +322,134 @@ function extractAnalysis(data) {
 
 
 /* ============================================================
-   LOAD COMPONENTS
+   CONNECTION STATUS
+   ============================================================ */
+
+async function checkConnection() {
+
+    const statusElement =
+        $("systemStatus") ||
+        $("connectionStatus");
+
+    const statusDot =
+        $("systemStatusDot");
+
+    try {
+
+        const health =
+            await apiRequest("/health");
+
+        if (statusElement) {
+
+            statusElement.textContent =
+                health.status === "healthy"
+                    ? "System Online"
+                    : "System Ready";
+
+            statusElement.classList.remove(
+                "offline",
+                "connecting"
+            );
+
+            statusElement.classList.add(
+                "online"
+            );
+        }
+
+        if (statusDot) {
+
+            statusDot.classList.remove(
+                "offline",
+                "connecting"
+            );
+
+            statusDot.classList.add(
+                "online"
+            );
+        }
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            "Backend connection failed:",
+            error
+        );
+
+        if (statusElement) {
+
+            statusElement.textContent =
+                "Backend Offline";
+
+            statusElement.classList.remove(
+                "online",
+                "connecting"
+            );
+
+            statusElement.classList.add(
+                "offline"
+            );
+        }
+
+        if (statusDot) {
+
+            statusDot.classList.remove(
+                "online",
+                "connecting"
+            );
+
+            statusDot.classList.add(
+                "offline"
+            );
+        }
+
+        return false;
+    }
+}
+
+
+/* ============================================================
+   COMPONENTS
    ============================================================ */
 
 async function loadComponents() {
+
     const response =
         await apiRequest("/components");
 
     const components =
         extractComponents(response);
 
-    state.components = components;
+    state.components =
+        components;
 
     populateComponentSelector(
+        components
+    );
+
+    updateDatasetInfo(
+        components
+    );
+
+    updateSummary(
         components
     );
 
     return components;
 }
 
-function getComponentId(component) {
-    return (
-        component?.component_id ??
-        component?.id ??
-        component?.ComponentID ??
-        ""
-    );
-}
-
-function getComponentType(component) {
-    return (
-        component?.component_type ??
-        component?.type ??
-        ""
-    );
-}
-
-function getParameterName(component) {
-    return (
-        component?.parameter_name ??
-        component?.parameter ??
-        ""
-    );
-}
 
 function populateComponentSelector(
     components
 ) {
+
     const select =
         $("componentSelect") ||
         $("component-selector");
 
     if (!select) {
+
         console.warn(
             "Component selector not found."
         );
@@ -385,176 +460,201 @@ function populateComponentSelector(
     select.innerHTML = "";
 
     if (!components.length) {
+
         const option =
-            document.createElement("option");
+            document.createElement(
+                "option"
+            );
 
         option.value = "";
+
         option.textContent =
             "No components available";
 
-        select.appendChild(option);
+        select.appendChild(
+            option
+        );
 
         return;
     }
 
     components.forEach(
         (component) => {
+
             const option =
                 document.createElement(
                     "option"
                 );
 
             const componentId =
-                getComponentId(component);
+                component.component_id ||
+                component.id ||
+                component.ComponentID ||
+                "";
 
             const componentType =
-                getComponentType(component);
+                component.component_type ||
+                component.type ||
+                "";
 
             const parameter =
-                getParameterName(component);
+                component.parameter_name ||
+                component.parameter ||
+                "";
 
-            option.value = componentId;
+            option.value =
+                componentId;
 
             option.textContent =
                 `${componentId} — ${componentType} — ${parameter}`;
 
-            select.appendChild(option);
+            select.appendChild(
+                option
+            );
         }
     );
 
     if (
         state.selectedComponentId &&
         components.some(
-            (component) =>
+            component =>
                 String(
-                    getComponentId(component)
+                    component.component_id ||
+                    component.id ||
+                    component.ComponentID
                 ) ===
                 String(
                     state.selectedComponentId
                 )
         )
     ) {
+
         select.value =
             state.selectedComponentId;
+
     } else {
+
         state.selectedComponentId =
             select.value;
     }
 }
 
 
-/* ============================================================
-   COMPONENT LOOKUP
-   ============================================================ */
-
-function findComponent(componentId) {
-    return state.components.find(
-        (component) =>
-            String(
-                getComponentId(component)
-            ) ===
-            String(componentId)
-    );
-}
-
-
-/* ============================================================
-   ENGINEERING LIMITS
-   ============================================================ */
-
-const ENGINEERING_LIMITS = {
-    "Logic IC": {
-        "Iddq": 50
-    },
-
-    "Memory IC": {
-        "Standby Current": 80
-    },
-
-    "ADC": {
-        "Leakage Current": 25
-    },
-
-    "Driver IC": {
-        "Propagation Delay": 40
-    }
-};
-
-function getEngineeringLimit(data) {
-    const explicitLimit =
-        Number(
-            data?.engineering_limit
-        );
-
-    if (
-        Number.isFinite(
-            explicitLimit
-        ) &&
-        explicitLimit > 0
-    ) {
-        return explicitLimit;
-    }
-
-    const componentType =
-        data?.component_type ||
-        data?.type ||
-        "";
-
-    const parameter =
-        data?.parameter_name ||
-        data?.parameter ||
-        "";
-
-    return (
-        ENGINEERING_LIMITS[
-            componentType
-        ]?.[parameter] ??
-        null
-    );
-}
-
-function calculateLimitUtilization(data) {
-    const limit =
-        getEngineeringLimit(data);
-
-    if (
-        !Number.isFinite(limit) ||
-        limit <= 0
-    ) {
-        return null;
-    }
-
-    const currentValue =
-        Number(
-            data?.value_168h ??
-            data?.value_96h ??
-            data?.value_24h ??
-            data?.value_0h
-        );
-
-    if (
-        !Number.isFinite(currentValue)
-    ) {
-        return null;
-    }
-
-    return (
-        currentValue /
-        limit *
-        100
-    );
-}
-
-
-/* ============================================================
-   LOAD AND ANALYZE SINGLE COMPONENT
-   ============================================================ */
-
-async function loadComponent(
+function findComponent(
     componentId
 ) {
+
+    return state.components.find(
+        (component) => {
+
+            const id =
+                component.component_id ||
+                component.id ||
+                component.ComponentID;
+
+            return String(id) ===
+                String(componentId);
+        }
+    );
+}
+
+
+/* ============================================================
+   DATASET INFORMATION
+   ============================================================ */
+
+function updateDatasetInfo(
+    components
+) {
+
+    setText(
+        "datasetCount",
+        components.length
+            ? components.length.toLocaleString()
+            : "0"
+    );
+
+    setText(
+        "datasetStatus",
+        components.length
+            ? "Ready"
+            : "No data"
+    );
+
+    setText(
+        "datasetName",
+        "Project Dataset"
+    );
+}
+
+
+/* ============================================================
+   SUMMARY
+   ============================================================ */
+
+function updateSummary(
+    components
+) {
+
+    let normal = 0;
+    let review = 0;
+    let highRisk = 0;
+
+    components.forEach(
+        component => {
+
+            const risk =
+                normalizeRisk(
+                    component.risk_level ||
+                    component.risk ||
+                    component.status
+                );
+
+            if (risk === "NORMAL") {
+                normal++;
+            } else if (
+                risk === "HIGH RISK" ||
+                risk === "CRITICAL"
+            ) {
+                highRisk++;
+            } else {
+                review++;
+            }
+        }
+    );
+
+    setText(
+        "normalCount",
+        normal.toLocaleString()
+    );
+
+    setText(
+        "reviewCount",
+        review.toLocaleString()
+    );
+
+    setText(
+        "highRiskCount",
+        highRisk.toLocaleString()
+    );
+
+    setText(
+        "totalCount",
+        components.length.toLocaleString()
+    );
+}
+
+
+/* ============================================================
+   ANALYZE COMPONENT
+   ============================================================ */
+
+async function analyzeComponent(
+    componentId
+) {
+
     if (!componentId) {
-        return;
+        return null;
     }
 
     state.selectedComponentId =
@@ -562,59 +662,34 @@ async function loadComponent(
 
     setText(
         "componentStatus",
-        `${componentId} screening in progress...`
+        `${componentId} AI screening in progress...`
     );
 
+    /*
+       IMPORTANT:
+       Use GET /analyze/{component_id}
+       first because this endpoint returns the
+       complete analysis including:
+
+       - anomaly
+       - risk
+       - predicted_168h
+       - predicted_slope
+       - engineering_limit
+       - limit_utilization
+       - reasons
+    */
+
     try {
-        /*
-         * Use the analysis endpoint first.
-         * This is the important endpoint because
-         * it runs anomaly detection, prediction,
-         * and risk assessment.
-         */
 
-        let response;
-
-        try {
-            response =
-                await apiRequest(
-                    `/analyze/${encodeURIComponent(
-                        componentId
-                    )}`
-                );
-
-        } catch (analysisError) {
-            console.warn(
-                "GET /analyze/{component_id} failed:",
-                analysisError
+        const response =
+            await apiRequest(
+                `/analyze/${encodeURIComponent(
+                    componentId
+                )}`
             );
 
-            /*
-             * Compatibility fallback.
-             */
-
-            try {
-                response =
-                    await apiRequest(
-                        `/components/${encodeURIComponent(
-                            componentId
-                        )}`
-                    );
-
-            } catch (componentError) {
-                console.warn(
-                    "GET /components/{component_id} failed:",
-                    componentError
-                );
-
-                response =
-                    findComponent(
-                        componentId
-                    ) || {};
-            }
-        }
-
-        const result =
+        const analysis =
             extractAnalysis(response);
 
         const baseComponent =
@@ -624,7 +699,7 @@ async function loadComponent(
 
         state.selectedResult = {
             ...baseComponent,
-            ...result
+            ...analysis
         };
 
         renderAnalysis(
@@ -636,37 +711,23 @@ async function loadComponent(
             `${componentId} AI screening complete.`
         );
 
-    } catch (error) {
-        console.error(
-            "Component analysis failed:",
-            error
-        );
+        return state.selectedResult;
 
-        setText(
-            "componentStatus",
-            `Screening failed: ${error.message}`
-        );
+    } catch (getError) {
 
-        showError(
-            error.message
+        console.warn(
+            "GET /analyze/{component_id} failed:",
+            getError
         );
     }
-}
 
 
-/* ============================================================
-   OPTIONAL POST ANALYSIS
-   ============================================================ */
-
-async function analyzeSelectedComponent() {
-    const componentId =
-        state.selectedComponentId;
-
-    if (!componentId) {
-        return;
-    }
+    /*
+       Fallback to POST /analyze.
+    */
 
     try {
+
         const response =
             await apiRequest(
                 "/analyze",
@@ -679,176 +740,219 @@ async function analyzeSelectedComponent() {
                 }
             );
 
-        const result =
+        const analysis =
             extractAnalysis(response);
 
-        state.selectedResult = {
-            ...(findComponent(
+        const baseComponent =
+            findComponent(
                 componentId
-            ) || {}),
-            ...result
+            ) || {};
+
+        state.selectedResult = {
+            ...baseComponent,
+            ...analysis
         };
 
         renderAnalysis(
             state.selectedResult
         );
 
-    } catch (error) {
+        setText(
+            "componentStatus",
+            `${componentId} AI screening complete.`
+        );
+
+        return state.selectedResult;
+
+    } catch (postError) {
+
         console.warn(
             "POST /analyze failed:",
-            error
+            postError
         );
+    }
 
-        await loadComponent(
+
+    /*
+       Final fallback:
+       local component data.
+
+       This keeps the UI usable, but does NOT
+       pretend that local raw data is an AI
+       analysis.
+    */
+
+    const localComponent =
+        findComponent(
             componentId
         );
+
+    if (localComponent) {
+
+        state.selectedResult = {
+            ...localComponent
+        };
+
+        renderAnalysis(
+            state.selectedResult
+        );
+
+        setText(
+            "componentStatus",
+            `${componentId} loaded from dataset.`
+        );
+
+        return state.selectedResult;
     }
+
+    throw new Error(
+        `Component ${componentId} could not be analyzed.`
+    );
 }
 
 
 /* ============================================================
-   RENDER COMPLETE ANALYSIS
+   COMPONENT INFORMATION
    ============================================================ */
 
-function renderAnalysis(data) {
-    if (!data) {
-        return;
-    }
+function renderComponentInfo(
+    data
+) {
 
-    renderOverview(data);
-    renderRiskPanel(data);
-    renderPrediction(data);
-    renderReasons(data);
-    renderGraph(data);
-    renderEngineeringLimit(data);
-}
-
-
-/* ============================================================
-   COMPONENT OVERVIEW
-   ============================================================ */
-
-function renderOverview(data) {
     const componentId =
-        data.component_id ??
-        data.id ??
+        data.component_id ||
+        data.id ||
         "—";
 
     const componentType =
-        data.component_type ??
-        data.type ??
+        data.component_type ||
+        data.type ||
         "—";
 
     const parameter =
-        data.parameter_name ??
-        data.parameter ??
-        "—";
-
-    const lot =
-        data.lot_id ??
-        data.lot ??
+        data.parameter_name ||
+        data.parameter ||
         "—";
 
     const unit =
-        data.unit ??
-        "";
-
-    const risk =
-        normalizeRisk(
-            data.risk_level ??
-            data.risk
+        cleanUnit(
+            data.unit || ""
         );
 
-    const value0 =
-        data.value_0h ??
-        data["0h"];
+    const lot =
+        data.lot_id ||
+        data.lot ||
+        "—";
 
-    const value24 =
-        data.value_24h ??
-        data["24h"];
-
-    const overviewBody =
-        $("overviewBody") ||
-        $("componentOverviewBody");
-
-    if (overviewBody) {
-        overviewBody.innerHTML = `
-            <tr>
-                <td>
-                    ${escapeHTML(
-                        componentId
-                    )}
-                </td>
-
-                <td>
-                    ${escapeHTML(
-                        componentType
-                    )}
-                </td>
-
-                <td>
-                    ${escapeHTML(
-                        parameter
-                    )}
-                </td>
-
-                <td>
-                    ${escapeHTML(
-                        lot
-                    )}
-                </td>
-
-                <td>
-                    ${escapeHTML(
-                        formatValue(
-                            value0,
-                            unit
-                        )
-                    )}
-                </td>
-
-                <td>
-                    ${escapeHTML(
-                        formatValue(
-                            value24,
-                            unit
-                        )
-                    )}
-                </td>
-
-                <td>
-                    <span
-                        class="risk-badge ${riskClass(
-                            risk
-                        )}"
-                    >
-                        ${escapeHTML(
-                            risk
-                        )}
-                    </span>
-                </td>
-            </tr>
-        `;
-    }
+    const temperature =
+        numberValue(
+            data.temperature_c
+        );
 
     setText(
-        "detailComponentId",
+        "componentId",
         componentId
     );
 
     setText(
-        "detailComponentType",
+        "componentType",
         componentType
     );
 
     setText(
-        "detailParameter",
+        "parameterName",
         parameter
     );
 
     setText(
-        "detailLot",
+        "parameterUnit",
+        unit || "—"
+    );
+
+    setText(
+        "lotId",
         lot
+    );
+
+    setText(
+        "temperature",
+        temperature === null
+            ? "—"
+            : `${formatNumber(
+                temperature,
+                2
+            )} °C`
+    );
+}
+
+
+/* ============================================================
+   CLEAN UNIT
+   ============================================================ */
+
+function cleanUnit(unit) {
+
+    if (!unit) {
+        return "";
+    }
+
+    const value =
+        String(unit);
+
+    /*
+       Fix common UTF-8 display corruption
+       such as ÂµA.
+    */
+
+    return value
+        .replace(/ÂµA/g, "µA")
+        .replace(/Âµ/g, "µ")
+        .replace(/µA/g, "µA");
+}
+
+
+/* ============================================================
+   COMPLETE RENDER
+   ============================================================ */
+
+function renderAnalysis(
+    data
+) {
+
+    if (!data) {
+        return;
+    }
+
+    renderComponentInfo(
+        data
+    );
+
+    renderRiskPanel(
+        data
+    );
+
+    renderAnomalyPanel(
+        data
+    );
+
+    renderPrediction(
+        data
+    );
+
+    renderEngineeringLimit(
+        data
+    );
+
+    renderReasons(
+        data
+    );
+
+    renderGraph(
+        data
+    );
+
+    renderOverview(
+        data
     );
 }
 
@@ -857,10 +961,15 @@ function renderOverview(data) {
    RISK PANEL
    ============================================================ */
 
-function renderRiskPanel(data) {
+function renderRiskPanel(
+    data
+) {
+
     const riskScore =
-        data.risk_score ??
-        data.riskScore;
+        numberValue(
+            data.risk_score ??
+            data.riskScore
+        );
 
     const riskLevel =
         normalizeRisk(
@@ -869,228 +978,349 @@ function renderRiskPanel(data) {
             data.status
         );
 
-    const anomalyScore =
-        data.anomaly_score ??
-        data.anomaly_index ??
-        data.anomalyIndex;
-
-    const anomalyLabel =
-        data.anomaly_label ??
-        (
-            data.anomaly_flag
-                ? "ANOMALY"
-                : "NORMAL"
+    const colors =
+        riskColors(
+            riskLevel
         );
 
-    const earlyDrift =
-        data.early_drift_index ??
-        data.earlyDriftIndex;
-
-    const futureDrift =
-        data.future_drift_index ??
-        data.futureDriftIndex;
-
-    let limitUtilization =
-        data.limit_utilization ??
-        data.limitUtilization;
-
-    if (
-        !Number.isFinite(
-            Number(limitUtilization)
-        )
-    ) {
-        limitUtilization =
-            calculateLimitUtilization(
-                data
-            );
-    }
+    /*
+       Risk score
+    */
 
     setText(
         "riskScore",
-        Number.isFinite(
-            Number(riskScore)
-        )
-            ? formatNumber(
+        riskScore === null
+            ? "—"
+            : formatNumber(
                 riskScore,
                 1
             )
-            : "—"
     );
 
-    setText(
-        "riskLevel",
-        riskLevel
-    );
 
-    setText(
-        "anomalyScore",
-        Number.isFinite(
-            Number(anomalyScore)
-        )
-            ? formatNumber(
-                anomalyScore,
-                2
-            )
-            : "—"
-    );
+    /*
+       Risk badge
+    */
 
-    setText(
-        "anomalyLabel",
-        anomalyLabel
-    );
+    const badge =
+        $("riskBadge");
 
-    setText(
-        "earlyDriftIndex",
-        Number.isFinite(
-            Number(earlyDrift)
-        )
-            ? formatNumber(
-                earlyDrift,
-                1
-            )
-            : "—"
-    );
+    if (badge) {
 
-    setText(
-        "futureDriftIndex",
-        Number.isFinite(
-            Number(futureDrift)
-        )
-            ? formatNumber(
-                futureDrift,
-                1
-            )
-            : "—"
-    );
+        badge.textContent =
+            riskLevel;
 
-    setText(
-        "limitUtilization",
-        Number.isFinite(
-            Number(limitUtilization)
-        )
-            ? `${formatNumber(
-                limitUtilization,
-                2
-            )}%`
-            : "—"
-    );
+        badge.classList.remove(
+            "badge-normal",
+            "badge-review",
+            "badge-high",
+            "badge-high-risk",
+            "badge-critical",
+            "normal",
+            "review",
+            "high-risk",
+            "critical"
+        );
 
-    const riskElement =
-        $("riskLevel");
-
-    if (riskElement) {
-        riskElement.className =
-            `risk-value ${riskClass(
+        badge.classList.add(
+            `badge-${riskClass(
                 riskLevel
-            )}`;
+            )}`
+        );
+
+        /*
+           Inline styling guarantees that the
+           correct color appears even if the
+           stylesheet has an older class name.
+        */
+
+        badge.style.color =
+            colors.color;
+
+        badge.style.borderColor =
+            colors.border;
+
+        badge.style.backgroundColor =
+            colors.background;
     }
+
+
+    /*
+       Risk score number color
+    */
+
+    const scoreElement =
+        $("riskScore");
+
+    if (scoreElement) {
+
+        scoreElement.style.color =
+            colors.color;
+    }
+
+
+    /*
+       Risk progress bar
+    */
+
+    const riskBar =
+        $("riskBar");
+
+    if (riskBar) {
+
+        const safeScore =
+            riskScore === null
+                ? 0
+                : Math.max(
+                    0,
+                    Math.min(
+                        100,
+                        riskScore
+                    )
+                );
+
+        riskBar.style.width =
+            `${safeScore}%`;
+
+        riskBar.style.background =
+            colors.color;
+
+        riskBar.style.borderRadius =
+            "999px";
+
+        riskBar.style.transition =
+            "width 0.35s ease, background 0.25s ease";
+    }
+
+
+    /*
+       Decision text
+    */
+
+    let decision =
+        data.risk_decision ||
+        data.decision;
+
+    if (!decision) {
+
+        if (
+            riskLevel ===
+            "CRITICAL"
+        ) {
+            decision =
+                "CRITICAL — REJECT / INVESTIGATE";
+
+        } else if (
+            riskLevel ===
+            "HIGH RISK"
+        ) {
+            decision =
+                "HIGH RISK — REVIEW / INVESTIGATE";
+
+        } else if (
+            riskLevel ===
+            "REVIEW"
+        ) {
+            decision =
+                "REVIEW — ADDITIONAL SCREENING RECOMMENDED";
+
+        } else {
+            decision =
+                "NORMAL — ACCEPT";
+        }
+    }
+
+    setText(
+        "riskDecision",
+        decision
+    );
 }
 
 
 /* ============================================================
-   ENGINEERING LIMIT PANEL
+   ANOMALY PANEL
    ============================================================ */
 
-function renderEngineeringLimit(data) {
-    const limit =
-        getEngineeringLimit(data);
+function renderAnomalyPanel(
+    data
+) {
 
-    const unit =
-        data?.unit ||
-        "";
-
-    const utilization =
-        data?.limit_utilization ??
-        calculateLimitUtilization(
-            data
+    const anomalyIndex =
+        numberValue(
+            data.anomaly_index ??
+            data.anomaly_score ??
+            data.anomalyIndex
         );
 
-    const limitElement =
-        $("engineeringLimit");
+    const anomalyFlag =
+        Number(data.anomaly_flag) === 1 ||
+        data.anomaly_flag === true;
 
-    if (limitElement) {
+    const backendLabel =
+        data.anomaly_label;
+
+    let anomalyLabel =
+        backendLabel ||
+        (
+            anomalyFlag
+                ? "ANOMALY"
+                : "NORMAL"
+        );
+
+    anomalyLabel =
+        String(
+            anomalyLabel
+        ).toUpperCase();
+
+
+    /*
+       Anomaly badge
+    */
+
+    const badge =
+        $("anomalyBadge");
+
+    if (badge) {
+
+        badge.textContent =
+            anomalyLabel;
+
+        badge.classList.remove(
+            "badge-normal",
+            "badge-anomaly",
+            "badge-review",
+            "normal",
+            "anomaly",
+            "review"
+        );
+
         if (
-            Number.isFinite(
-                Number(limit)
+            anomalyLabel.includes(
+                "ANOMAL"
             )
         ) {
-            limitElement.textContent =
-                `${formatNumber(
-                    limit,
-                    2
-                )}${unit ? ` ${unit}` : ""}`;
+
+            badge.classList.add(
+                "badge-anomaly"
+            );
+
+            badge.style.color =
+                "#ff4d57";
+
+            badge.style.borderColor =
+                "#ff4d57";
+
+            badge.style.backgroundColor =
+                "rgba(255, 77, 87, 0.10)";
+
         } else {
-            limitElement.textContent =
-                "—";
+
+            badge.classList.add(
+                "badge-normal"
+            );
+
+            badge.style.color =
+                "#20c66b";
+
+            badge.style.borderColor =
+                "#20c66b";
+
+            badge.style.backgroundColor =
+                "rgba(32, 198, 107, 0.10)";
         }
     }
 
-    const utilizationElement =
-        $("limitUtilization");
 
-    if (utilizationElement) {
-        if (
-            Number.isFinite(
-                Number(utilization)
+    /*
+       Anomaly index
+    */
+
+    setText(
+        "anomalyScore",
+        anomalyIndex === null
+            ? "—"
+            : formatNumber(
+                anomalyIndex,
+                2
             )
-        ) {
-            utilizationElement.textContent =
-                `${formatNumber(
-                    utilization,
-                    2
-                )}%`;
-        } else {
-            utilizationElement.textContent =
-                "—";
-        }
-    }
+    );
 
-    const progress =
-        $("limitProgress") ||
-        $("utilizationProgress");
 
-    if (progress) {
-        if (
-            Number.isFinite(
-                Number(utilization)
-            )
-        ) {
-            const percentage =
-                Math.max(
-                    0,
-                    Math.min(
-                        100,
-                        Number(
-                            utilization
-                        )
+    /*
+       Early drift
+    */
+
+    const earlyDrift =
+        numberValue(
+            data.early_drift_index ??
+            data.earlyDriftIndex
+        );
+
+    setText(
+        "earlyDrift",
+        earlyDrift === null
+            ? (
+                numberValue(
+                    data.drift_0_24
+                ) === null
+                    ? "—"
+                    : formatNumber(
+                        data.drift_0_24,
+                        2
                     )
-                );
+            )
+            : formatNumber(
+                earlyDrift,
+                2
+            )
+    );
 
-            if (
-                progress.tagName ===
-                "PROGRESS"
-            ) {
-                progress.value =
-                    percentage;
 
-                progress.max =
-                    100;
-            } else {
-                progress.style.width =
-                    `${percentage}%`;
-            }
-        } else {
-            if (
-                progress.tagName ===
-                "PROGRESS"
-            ) {
-                progress.value = 0;
-            } else {
-                progress.style.width =
-                    "0%";
-            }
-        }
-    }
+    /*
+       0h
+    */
+
+    const value0 =
+        numberValue(
+            data.value_0h
+        );
+
+    const unit =
+        cleanUnit(
+            data.unit || ""
+        );
+
+    setText(
+        "value0h",
+        value0 === null
+            ? "—"
+            : formatValue(
+                value0,
+                unit,
+                2
+            )
+    );
+
+
+    /*
+       24h
+    */
+
+    const value24 =
+        numberValue(
+            data.value_24h
+        );
+
+    setText(
+        "value24h",
+        value24 === null
+            ? "—"
+            : formatValue(
+                value24,
+                unit,
+                2
+            )
+    );
 }
 
 
@@ -1098,201 +1328,1122 @@ function renderEngineeringLimit(data) {
    PREDICTION
    ============================================================ */
 
-function renderPrediction(data) {
+function renderPrediction(
+    data
+) {
+
     const unit =
-        data.unit ||
-        "";
+        cleanUnit(
+            data.prediction_unit ||
+            data.parameter_unit ||
+            data.unit ||
+            ""
+        );
+
+
+    /*
+       168h predicted value
+    */
 
     const predicted168 =
-        data.predicted_168h ??
-        data.predicted168h;
-
-    const actual168 =
-        data.value_168h ??
-        data["168h"];
-
-    const slope =
-        data.predicted_slope ??
-        data.predictedSlope;
-
-    const safetySlope =
-        data.safety_slope ??
-        data.safetySlope;
+        numberValue(
+            data.predicted_168h
+        );
 
     setText(
         "predicted168h",
-        formatValue(
-            predicted168,
-            unit
-        )
+        predicted168 === null
+            ? "—"
+            : formatNumber(
+                predicted168,
+                2
+            )
     );
+
+
+    /*
+       Prediction unit
+    */
+
+    setText(
+        "predictionUnit",
+        unit || "—"
+    );
+
+
+    /*
+       Actual 168h if the HTML contains it
+    */
+
+    const actual168 =
+        numberValue(
+            data.value_168h
+        );
 
     setText(
         "actual168h",
-        formatValue(
-            actual168,
-            unit
-        )
+        actual168 === null
+            ? "—"
+            : formatValue(
+                actual168,
+                unit,
+                2
+            )
     );
+
+
+    /*
+       Future drift
+    */
+
+    let futureDrift =
+        numberValue(
+            data.future_drift_index ??
+            data.futureDriftIndex
+        );
+
+    /*
+       If backend does not provide a future
+       drift index, calculate a simple
+       normalized future drift from the
+       prediction and 24h value.
+    */
+
+    if (
+        futureDrift === null &&
+        predicted168 !== null
+    ) {
+
+        const value24 =
+            numberValue(
+                data.value_24h
+            );
+
+        if (
+            value24 !== null &&
+            value24 !== 0
+        ) {
+
+            futureDrift =
+                Math.abs(
+                    predicted168 -
+                    value24
+                ) /
+                Math.abs(
+                    value24
+                ) *
+                100;
+        }
+    }
+
+    setText(
+        "futureDrift",
+        futureDrift === null
+            ? "—"
+            : formatNumber(
+                futureDrift,
+                2
+            )
+    );
+
+
+    /*
+       Predicted slope
+    */
+
+    const predictedSlope =
+        numberValue(
+            data.predicted_slope
+        );
 
     setText(
         "predictedSlope",
-        Number.isFinite(
-            Number(slope)
-        )
-            ? formatNumber(
-                slope,
+        predictedSlope === null
+            ? "—"
+            : formatNumber(
+                predictedSlope,
                 6
             )
-            : "—"
     );
+
+
+    /*
+       Safety slope if present
+    */
+
+    const safetySlope =
+        numberValue(
+            data.safety_slope
+        );
 
     setText(
         "safetySlope",
-        Number.isFinite(
-            Number(safetySlope)
-        )
-            ? formatNumber(
+        safetySlope === null
+            ? "—"
+            : formatNumber(
                 safetySlope,
                 6
             )
-            : "—"
     );
 }
 
 
 /* ============================================================
-   REASONS / EXPLAINABILITY
+   ENGINEERING LIMIT
    ============================================================ */
 
-function renderReasons(data) {
-    const reasons =
-        Array.isArray(
-            data.reasons
+function getEngineeringLimit(
+    data
+) {
+
+    const direct =
+        numberValue(
+            data.engineering_limit
+        );
+
+    if (direct !== null) {
+        return direct;
+    }
+
+    /*
+       Prototype engineering limits.
+       These match the current AegisBurn
+       project dataset configuration.
+    */
+
+    const parameter =
+        String(
+            data.parameter_name ||
+            ""
+        ).toLowerCase();
+
+    if (
+        parameter.includes(
+            "iddq"
         )
-            ? data.reasons
-            : [];
+    ) {
+        return 50;
+    }
+
+    if (
+        parameter.includes(
+            "standby"
+        )
+    ) {
+        return 80;
+    }
+
+    if (
+        parameter.includes(
+            "leakage"
+        )
+    ) {
+        return 25;
+    }
+
+    if (
+        parameter.includes(
+            "propagation"
+        )
+    ) {
+        return 40;
+    }
+
+    return null;
+}
+
+
+function calculateLimitUtilization(
+    data
+) {
+
+    const limit =
+        getEngineeringLimit(
+            data
+        );
+
+    if (
+        limit === null ||
+        limit <= 0
+    ) {
+        return null;
+    }
+
+    const values = [
+        data.value_0h,
+        data.value_24h,
+        data.value_96h,
+        data.value_168h,
+        data.predicted_168h
+    ]
+        .map(Number)
+        .filter(
+            Number.isFinite
+        );
+
+    if (!values.length) {
+        return null;
+    }
+
+    /*
+       Use the highest measured/predicted
+       value so the safety panel reflects
+       the worst available condition.
+    */
+
+    const maximum =
+        Math.max(
+            ...values
+        );
+
+    return Math.max(
+        0,
+        Math.min(
+            100,
+            maximum /
+            limit *
+            100
+        )
+    );
+}
+
+
+function renderEngineeringLimit(
+    data
+) {
+
+    const limit =
+        getEngineeringLimit(
+            data
+        );
+
+    const unit =
+        cleanUnit(
+            data.unit ||
+            data.parameter_unit ||
+            ""
+        );
+
+
+    /*
+       Backend utilization is used when it
+       contains a meaningful value.
+
+       If backend returns 0 while the actual
+       measured/predicted values are non-zero,
+       calculate the display utilization.
+    */
+
+    let utilization =
+        numberValue(
+            data.limit_utilization
+        );
+
+    const calculated =
+        calculateLimitUtilization(
+            data
+        );
+
+    if (
+        calculated !== null &&
+        (
+            utilization === null ||
+            utilization === 0
+        )
+    ) {
+        utilization =
+            calculated;
+    }
+
+
+    /*
+       Engineering limit
+    */
+
+    setText(
+        "engineeringLimit",
+        limit === null
+            ? "—"
+            : `${formatNumber(
+                limit,
+                2
+            )}${unit ? ` ${unit}` : ""}`
+    );
+
+
+    /*
+       Utilization percentage
+    */
+
+    setText(
+        "limitUtilization",
+        utilization === null
+            ? "—"
+            : `${formatNumber(
+                utilization,
+                2
+            )}%`
+    );
+
+
+    /*
+       Limit bar
+    */
+
+    const limitBar =
+        $("limitBar");
+
+    if (limitBar) {
+
+        const percentage =
+            utilization === null
+                ? 0
+                : Math.max(
+                    0,
+                    Math.min(
+                        100,
+                        utilization
+                    )
+                );
+
+        limitBar.style.width =
+            `${percentage}%`;
+
+        let color =
+            "#20c66b";
+
+        if (
+            percentage >= 90
+        ) {
+            color =
+                "#ff4d57";
+        } else if (
+            percentage >= 70
+        ) {
+            color =
+                "#ff7a18";
+        } else if (
+            percentage >= 50
+        ) {
+            color =
+                "#f5b942";
+        }
+
+        limitBar.style.background =
+            color;
+
+        limitBar.style.borderRadius =
+            "999px";
+
+        limitBar.style.transition =
+            "width 0.35s ease";
+    }
+
+
+    /*
+       Limit bar label
+    */
+
+    if (utilization === null) {
+
+        setText(
+            "limitBarLabel",
+            "Select a component to view engineering-limit utilization."
+        );
+
+    } else {
+
+        setText(
+            "limitBarLabel",
+            `${formatNumber(
+                utilization,
+                2
+            )}% of engineering limit`
+        );
+    }
+}
+
+
+/* ============================================================
+   REASONS
+   ============================================================ */
+
+function renderReasons(
+    data
+) {
 
     const container =
-        $("reasonsList") ||
-        $("riskReasons");
+        $("riskReasons") ||
+        $("reasonsList");
 
     if (!container) {
         return;
     }
 
+    let reasons = [];
+
+    if (
+        Array.isArray(
+            data.risk_reasons
+        )
+    ) {
+        reasons =
+            data.risk_reasons;
+    }
+
+    if (
+        Array.isArray(
+            data.reasons
+        ) &&
+        data.reasons.length
+    ) {
+        reasons =
+            data.reasons;
+    }
+
+
+    /*
+       If backend does not provide reasons,
+       create transparent reasons from the
+       returned metrics.
+
+       This is UI explanation only.
+       It does not modify the backend risk.
+    */
+
     if (!reasons.length) {
-        container.innerHTML = `
-            <li>
+
+        const generated =
+            generateReasons(
+                data
+            );
+
+        reasons =
+            generated;
+    }
+
+
+    if (!reasons.length) {
+
+        container.innerHTML =
+            `
+            <div class="empty-reasons">
                 No additional risk factors reported.
-            </li>
-        `;
+            </div>
+            `;
 
         return;
     }
 
+
     container.innerHTML =
         reasons
             .map(
-                (reason) => `
-                    <li>
+                reason =>
+                    `
+                    <div class="reason-item">
                         ${escapeHTML(
                             reason
                         )}
-                    </li>
-                `
+                    </div>
+                    `
             )
             .join("");
 }
 
 
+function generateReasons(
+    data
+) {
+
+    const reasons = [];
+
+    const riskScore =
+        numberValue(
+            data.risk_score
+        );
+
+    const anomalyIndex =
+        numberValue(
+            data.anomaly_index ??
+            data.anomaly_score
+        );
+
+    const value24 =
+        numberValue(
+            data.value_24h
+        );
+
+    const value168 =
+        numberValue(
+            data.value_168h
+        );
+
+    const predicted168 =
+        numberValue(
+            data.predicted_168h
+        );
+
+    const limit =
+        getEngineeringLimit(
+            data
+        );
+
+
+    if (
+        riskScore !== null &&
+        riskScore >= 80
+    ) {
+
+        reasons.push(
+            `Overall risk score is ${formatNumber(
+                riskScore,
+                1
+            )}/100.`
+        );
+    }
+
+
+    if (
+        anomalyIndex !== null &&
+        anomalyIndex >= 70
+    ) {
+
+        reasons.push(
+            `Early anomaly index is elevated at ${formatNumber(
+                anomalyIndex,
+                2
+            )}.`
+        );
+    }
+
+
+    if (
+        value24 !== null &&
+        value168 !== null &&
+        value168 > value24
+    ) {
+
+        reasons.push(
+            `Measured parameter increased from ${formatNumber(
+                value24,
+                2
+            )} to ${formatNumber(
+                value168,
+                2
+            )}.`
+        );
+    }
+
+
+    if (
+        predicted168 !== null &&
+        limit !== null
+    ) {
+
+        const predictedUtilization =
+            predicted168 /
+            limit *
+            100;
+
+        if (
+            predictedUtilization >= 70
+        ) {
+
+            reasons.push(
+                `Predicted 168h value reaches ${formatNumber(
+                    predictedUtilization,
+                    1
+                )}% of the engineering limit.`
+            );
+        }
+    }
+
+
+    if (
+        data.defect_type &&
+        String(
+            data.defect_type
+        ).toUpperCase() !==
+        "NORMAL"
+    ) {
+
+        /*
+           Dataset ground-truth labels are
+           deliberately NOT used here.
+           They are only shown if already
+           supplied by the backend dataset.
+        */
+
+    }
+
+
+    return reasons;
+}
+
+
 /* ============================================================
-   BURN-IN GRAPH
-   SVG — NO EXTERNAL DEPENDENCY
+   OVERVIEW
    ============================================================ */
 
-function renderGraph(data) {
+function renderOverview(
+    data
+) {
+
+    const overviewBody =
+        $("overviewBody") ||
+        $("componentOverviewBody");
+
+    if (!overviewBody) {
+        return;
+    }
+
+    const componentId =
+        data.component_id ||
+        data.id ||
+        "—";
+
+    const componentType =
+        data.component_type ||
+        data.type ||
+        "—";
+
+    const parameter =
+        data.parameter_name ||
+        data.parameter ||
+        "—";
+
+    const lot =
+        data.lot_id ||
+        data.lot ||
+        "—";
+
+    const unit =
+        cleanUnit(
+            data.unit ||
+            ""
+        );
+
+    const value0 =
+        data.value_0h;
+
+    const value24 =
+        data.value_24h;
+
+    const risk =
+        normalizeRisk(
+            data.risk_level ||
+            data.risk
+        );
+
+    overviewBody.innerHTML =
+        `
+        <tr>
+            <td>
+                ${escapeHTML(
+                    componentId
+                )}
+            </td>
+
+            <td>
+                ${escapeHTML(
+                    componentType
+                )}
+            </td>
+
+            <td>
+                ${escapeHTML(
+                    parameter
+                )}
+            </td>
+
+            <td>
+                ${escapeHTML(
+                    lot
+                )}
+            </td>
+
+            <td>
+                ${escapeHTML(
+                    formatValue(
+                        value0,
+                        unit,
+                        2
+                    )
+                )}
+            </td>
+
+            <td>
+                ${escapeHTML(
+                    formatValue(
+                        value24,
+                        unit,
+                        2
+                    )
+                )}
+            </td>
+
+            <td>
+                <span
+                    class="risk-badge ${riskClass(
+                        risk
+                    )}"
+                >
+                    ${escapeHTML(
+                        risk
+                    )}
+                </span>
+            </td>
+        </tr>
+        `;
+}
+
+
+/* ============================================================
+   GRAPH
+   ============================================================ */
+
+function renderGraph(
+    data
+) {
+
     const container =
         $("burnInChart") ||
         $("trendChart") ||
         $("measurementChart");
 
     if (!container) {
-        console.warn(
-            "Chart container not found."
-        );
-
         return;
     }
 
     const measurements = [
         {
             hour: 0,
-            value: Number(
-                data.value_0h
-            )
+            value:
+                numberValue(
+                    data.value_0h
+                )
         },
-
         {
             hour: 24,
-            value: Number(
-                data.value_24h
-            )
+            value:
+                numberValue(
+                    data.value_24h
+                )
         },
-
         {
             hour: 96,
-            value: Number(
-                data.value_96h
-            )
+            value:
+                numberValue(
+                    data.value_96h
+                )
         },
-
         {
             hour: 168,
-            value: Number(
-                data.value_168h
-            )
+            value:
+                numberValue(
+                    data.value_168h
+                )
         }
     ].filter(
-        (point) =>
-            Number.isFinite(
-                point.value
-            )
+        point =>
+            point.value !== null
     );
 
+
     const predictedValue =
-        Number(
+        numberValue(
             data.predicted_168h
         );
 
+
     if (!measurements.length) {
-        container.innerHTML = `
-            <div class="chart-empty">
-                No measurement data available.
-            </div>
-        `;
+
+        if (
+            container.tagName ===
+            "CANVAS"
+        ) {
+
+            const context =
+                container.getContext(
+                    "2d"
+                );
+
+            if (context) {
+                context.clearRect(
+                    0,
+                    0,
+                    container.width,
+                    container.height
+                );
+            }
+
+        } else {
+
+            container.innerHTML =
+                `
+                <div class="chart-empty">
+                    No measurement data available.
+                </div>
+                `;
+        }
 
         return;
     }
 
-    const allValues =
+
+    /*
+       If the HTML uses a canvas,
+       use Chart.js when available.
+    */
+
+    if (
+        container.tagName ===
+        "CANVAS" &&
+        typeof Chart !==
+        "undefined"
+    ) {
+
+        renderChartJS(
+            container,
+            measurements,
+            predictedValue,
+            data
+        );
+
+        return;
+    }
+
+
+    /*
+       Otherwise render SVG.
+    */
+
+    renderSVGChart(
+        container,
+        measurements,
+        predictedValue,
+        data
+    );
+}
+
+
+/* ============================================================
+   CHART.JS
+   ============================================================ */
+
+function renderChartJS(
+    canvas,
+    measurements,
+    predictedValue,
+    data
+) {
+
+    if (
+        state.chart &&
+        typeof state.chart.destroy ===
+        "function"
+    ) {
+
+        try {
+            state.chart.destroy();
+        } catch {
+            // Ignore old chart cleanup errors.
+        }
+
+        state.chart = null;
+    }
+
+
+    const labels =
         measurements.map(
-            (point) =>
+            point =>
+                `${point.hour}h`
+        );
+
+    const measuredData =
+        measurements.map(
+            point =>
                 point.value
         );
 
-    if (
-        Number.isFinite(
-            predictedValue
-        )
-    ) {
-        allValues.push(
-            predictedValue
+
+    const predictedData =
+        measurements.map(
+            () => null
         );
+
+
+    /*
+       Draw prediction from 24h to 168h.
+    */
+
+    if (
+        predictedValue !== null
+    ) {
+
+        const index24 =
+            measurements.findIndex(
+                point =>
+                    point.hour === 24
+            );
+
+        const index168 =
+            measurements.findIndex(
+                point =>
+                    point.hour === 168
+            );
+
+        if (
+            index24 >= 0 &&
+            index168 >= 0
+        ) {
+
+            predictedData[
+                index24
+            ] =
+                measurements[
+                    index24
+                ].value;
+
+            predictedData[
+                index168
+            ] =
+                predictedValue;
+        }
     }
 
-    const width = 1000;
-    const height = 420;
+
+    const context =
+        canvas.getContext(
+            "2d"
+        );
+
+
+    state.chart =
+        new Chart(
+            context,
+            {
+                type: "line",
+
+                data: {
+                    labels,
+
+                    datasets: [
+                        {
+                            label:
+                                "Measured Value",
+
+                            data:
+                                measuredData,
+
+                            borderWidth:
+                                2,
+
+                            tension:
+                                0.25,
+
+                            pointRadius:
+                                4,
+
+                            fill:
+                                false
+                        },
+
+                        {
+                            label:
+                                "AI Predicted Trend",
+
+                            data:
+                                predictedData,
+
+                            borderWidth:
+                                2,
+
+                            borderDash:
+                                [
+                                    6,
+                                    5
+                                ],
+
+                            tension:
+                                0.25,
+
+                            pointRadius:
+                                4,
+
+                            fill:
+                                false
+                        }
+                    ]
+                },
+
+                options: {
+                    responsive:
+                        true,
+
+                    maintainAspectRatio:
+                        false,
+
+                    interaction: {
+                        mode:
+                            "index",
+
+                        intersect:
+                            false
+                    },
+
+                    plugins: {
+                        legend: {
+                            display:
+                                true
+                        }
+                    },
+
+                    scales: {
+                        x: {
+                            title: {
+                                display:
+                                    true,
+
+                                text:
+                                    "Burn-In Time (Hours)"
+                            }
+                        },
+
+                        y: {
+                            title: {
+                                display:
+                                    true,
+
+                                text:
+                                    data.parameter_name ||
+                                    "Measured Value"
+                            }
+                        }
+                    }
+                }
+            }
+        );
+}
+
+
+/* ============================================================
+   SVG FALLBACK CHART
+   ============================================================ */
+
+function renderSVGChart(
+    container,
+    measurements,
+    predictedValue,
+    data
+) {
+
+    const width =
+        1000;
+
+    const height =
+        420;
 
     const padding = {
         top: 45,
@@ -1311,6 +2462,23 @@ function renderGraph(data) {
         padding.top -
         padding.bottom;
 
+
+    const allValues =
+        measurements
+            .map(
+                point =>
+                    point.value
+            );
+
+    if (
+        predictedValue !== null
+    ) {
+        allValues.push(
+            predictedValue
+        );
+    }
+
+
     let minValue =
         Math.min(
             ...allValues
@@ -1325,10 +2493,16 @@ function renderGraph(data) {
         maxValue -
         minValue;
 
-    if (range === 0) {
+
+    if (
+        range === 0
+    ) {
+
         minValue -= 1;
         maxValue += 1;
+
     } else {
+
         minValue -=
             range * 0.12;
 
@@ -1336,23 +2510,37 @@ function renderGraph(data) {
             range * 0.12;
     }
 
-    const xScale = (hour) =>
-        padding.left +
-        (hour / 168) *
+
+    const xScale =
+        hour =>
+            padding.left +
+            (
+                hour /
+                168
+            ) *
             chartWidth;
 
-    const yScale = (value) =>
-        padding.top +
-        (
-            (maxValue - value) /
-            (maxValue - minValue)
-        ) *
+
+    const yScale =
+        value =>
+            padding.top +
+            (
+                (
+                    maxValue -
+                    value
+                ) /
+                (
+                    maxValue -
+                    minValue
+                )
+            ) *
             chartHeight;
+
 
     const linePoints =
         measurements
             .map(
-                (point) =>
+                point =>
                     `${xScale(
                         point.hour
                     )},${yScale(
@@ -1361,13 +2549,14 @@ function renderGraph(data) {
             )
             .join(" ");
 
+
     const areaPoints = [
         `${xScale(
             measurements[0].hour
         )},${padding.top + chartHeight}`,
 
         ...measurements.map(
-            (point) =>
+            point =>
                 `${xScale(
                     point.hour
                 )},${yScale(
@@ -1382,22 +2571,25 @@ function renderGraph(data) {
         )},${padding.top + chartHeight}`
     ].join(" ");
 
-    const predictedStart =
-        measurements.find(
-            (point) =>
-                point.hour === 24
-        ) ||
-        measurements[0];
 
-    let predictionLine = "";
+    let predictionLine =
+        "";
+
 
     if (
-        predictedStart &&
-        Number.isFinite(
-            predictedValue
-        )
+        predictedValue !== null
     ) {
-        predictionLine = `
+
+        const predictedStart =
+            measurements.find(
+                point =>
+                    point.hour === 24
+            ) ||
+            measurements[0];
+
+
+        predictionLine =
+            `
             <line
                 x1="${xScale(
                     predictedStart.hour
@@ -1420,55 +2612,75 @@ function renderGraph(data) {
                 r="6"
                 class="prediction-point"
             />
-        `;
+
+            <text
+                x="${xScale(168)}"
+                y="${yScale(
+                    predictedValue
+                ) - 14}"
+                text-anchor="middle"
+                class="chart-value-label"
+            >
+                AI ${formatNumber(
+                    predictedValue,
+                    2
+                )}
+            </text>
+            `;
     }
 
-    const horizontalGridCount = 6;
 
-    let gridLines = "";
-    let yLabels = "";
+    let gridLines =
+        "";
+
+    let yLabels =
+        "";
+
+
+    const gridCount =
+        6;
+
 
     for (
         let i = 0;
-        i <= horizontalGridCount;
+        i <= gridCount;
         i++
     ) {
+
         const ratio =
             i /
-            horizontalGridCount;
+            gridCount;
 
         const y =
             padding.top +
             ratio *
-                chartHeight;
+            chartHeight;
 
         const value =
             maxValue -
             ratio *
-                (
-                    maxValue -
-                    minValue
-                );
+            (
+                maxValue -
+                minValue
+            );
 
-        gridLines += `
+
+        gridLines +=
+            `
             <line
                 x1="${padding.left}"
                 y1="${y}"
-                x2="${
-                    width -
-                    padding.right
-                }"
+                x2="${width - padding.right}"
                 y2="${y}"
                 class="chart-grid"
             />
-        `;
+            `;
 
-        yLabels += `
+
+        yLabels +=
+            `
             <text
-                x="${
-                    padding.left -
-                    15
-                }"
+                x="${padding.left - 15}"
                 y="${y + 5}"
                 text-anchor="end"
                 class="chart-axis-label"
@@ -1478,8 +2690,13 @@ function renderGraph(data) {
                     1
                 )}
             </text>
-        `;
+            `;
     }
+
+
+    let xLabels =
+        "";
+
 
     const xTicks = [
         0,
@@ -1492,44 +2709,44 @@ function renderGraph(data) {
         168
     ];
 
-    let xLabels = "";
 
     xTicks.forEach(
-        (hour) => {
-            const x =
-                xScale(hour);
+        hour => {
 
-            xLabels += `
+            const x =
+                xScale(
+                    hour
+                );
+
+
+            xLabels +=
+                `
                 <line
                     x1="${x}"
                     y1="${padding.top}"
                     x2="${x}"
-                    y2="${
-                        padding.top +
-                        chartHeight
-                    }"
+                    y2="${padding.top + chartHeight}"
                     class="chart-grid vertical"
                 />
 
                 <text
                     x="${x}"
-                    y="${
-                        height -
-                        30
-                    }"
+                    y="${height - 30}"
                     text-anchor="middle"
                     class="chart-axis-label"
                 >
                     ${hour}h
                 </text>
-            `;
+                `;
         }
     );
+
 
     const circles =
         measurements
             .map(
-                (point) => `
+                point =>
+                    `
                     <circle
                         cx="${xScale(
                             point.hour
@@ -1544,16 +2761,21 @@ function renderGraph(data) {
                             ${point.hour}h:
                             ${formatValue(
                                 point.value,
-                                data.unit ||
+                                cleanUnit(
+                                    data.unit ||
                                     ""
+                                ),
+                                2
                             )}
                         </title>
                     </circle>
-                `
+                    `
             )
             .join("");
 
-    container.innerHTML = `
+
+    container.innerHTML =
+        `
         <svg
             class="burnin-svg"
             viewBox="0 0 ${width} ${height}"
@@ -1594,17 +2816,15 @@ function renderGraph(data) {
                 x="22"
                 y="${height / 2}"
                 text-anchor="middle"
-                transform="rotate(-90 22 ${
-                    height / 2
-                })"
+                transform="rotate(-90 22 ${height / 2})"
                 class="chart-axis-title"
             >
                 ${escapeHTML(
                     data.parameter_name ||
-                    data.parameter ||
                     "Measured Value"
                 )}
             </text>
+
         </svg>
 
         <div class="chart-legend">
@@ -1613,7 +2833,6 @@ function renderGraph(data) {
                 <span
                     class="legend-line measured"
                 ></span>
-
                 Measured Value
             </div>
 
@@ -1621,20 +2840,431 @@ function renderGraph(data) {
                 <span
                     class="legend-line predicted"
                 ></span>
-
                 AI Predicted Trend
             </div>
 
         </div>
-    `;
+        `;
 }
 
 
 /* ============================================================
-   ERROR DISPLAY
+   CSV UPLOAD
    ============================================================ */
 
-function showError(message) {
+function registerUploadEvents() {
+
+    const dropzone =
+        $("csvDropzone");
+
+    const input =
+        $("csvFileInput");
+
+    const uploadButton =
+        $("uploadCsvButton");
+
+    if (!dropzone || !input) {
+        return;
+    }
+
+
+    dropzone.addEventListener(
+        "click",
+        () => {
+            input.click();
+        }
+    );
+
+
+    dropzone.addEventListener(
+        "keydown",
+        event => {
+
+            if (
+                event.key ===
+                "Enter" ||
+                event.key ===
+                " "
+            ) {
+
+                event.preventDefault();
+
+                input.click();
+            }
+        }
+    );
+
+
+    input.addEventListener(
+        "change",
+        () => {
+
+            const file =
+                input.files?.[0];
+
+            if (!file) {
+                return;
+            }
+
+            setText(
+                "csvFileLabel",
+                file.name
+            );
+
+            if (uploadButton) {
+                uploadButton.disabled =
+                    false;
+            }
+
+            setText(
+                "uploadStatus",
+                `${file.name} selected.`
+            );
+        }
+    );
+
+
+    dropzone.addEventListener(
+        "dragover",
+        event => {
+
+            event.preventDefault();
+
+            dropzone.classList.add(
+                "dragover"
+            );
+        }
+    );
+
+
+    dropzone.addEventListener(
+        "dragleave",
+        () => {
+
+            dropzone.classList.remove(
+                "dragover"
+            );
+        }
+    );
+
+
+    dropzone.addEventListener(
+        "drop",
+        event => {
+
+            event.preventDefault();
+
+            dropzone.classList.remove(
+                "dragover"
+            );
+
+            const file =
+                event.dataTransfer
+                    ?.files?.[0];
+
+            if (!file) {
+                return;
+            }
+
+            if (
+                !file.name
+                    .toLowerCase()
+                    .endsWith(
+                        ".csv"
+                    )
+            ) {
+
+                setText(
+                    "uploadStatus",
+                    "Please select a CSV file."
+                );
+
+                return;
+            }
+
+            input.files =
+                event.dataTransfer.files;
+
+            setText(
+                "csvFileLabel",
+                file.name
+            );
+
+            if (uploadButton) {
+                uploadButton.disabled =
+                    false;
+            }
+
+            setText(
+                "uploadStatus",
+                `${file.name} selected.`
+            );
+        }
+    );
+
+
+    if (uploadButton) {
+
+        uploadButton.addEventListener(
+            "click",
+            uploadCSV
+        );
+    }
+}
+
+
+async function uploadCSV() {
+
+    const input =
+        $("csvFileInput");
+
+    const button =
+        $("uploadCsvButton");
+
+    const status =
+        $("uploadStatus");
+
+    const file =
+        input?.files?.[0];
+
+    if (!file) {
+        return;
+    }
+
+
+    try {
+
+        if (button) {
+            button.disabled =
+                true;
+
+            button.textContent =
+                "Uploading...";
+        }
+
+        if (status) {
+            status.textContent =
+                "Uploading and processing CSV...";
+        }
+
+
+        const formData =
+            new FormData();
+
+        formData.append(
+            "file",
+            file
+        );
+
+
+        const response =
+            await fetch(
+                `${API_BASE}/upload-csv`,
+                {
+                    method: "POST",
+                    body: formData
+                }
+            );
+
+
+        const contentType =
+            response.headers.get(
+                "content-type"
+            ) || "";
+
+
+        let data;
+
+        if (
+            contentType.includes(
+                "application/json"
+            )
+        ) {
+
+            data =
+                await response.json();
+
+        } else {
+
+            data = {
+                detail:
+                    await response.text()
+            };
+        }
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                data?.detail ||
+                data?.message ||
+                "CSV upload failed."
+            );
+        }
+
+
+        if (status) {
+
+            status.textContent =
+                "CSV uploaded successfully.";
+        }
+
+
+        await loadComponents();
+
+
+        const select =
+            $("componentSelect");
+
+        if (
+            select &&
+            select.value
+        ) {
+
+            state.selectedComponentId =
+                select.value;
+
+            await analyzeComponent(
+                select.value
+            );
+        }
+
+
+    } catch (error) {
+
+        console.error(
+            "CSV upload failed:",
+            error
+        );
+
+        if (status) {
+
+            status.textContent =
+                `Upload failed: ${error.message}`;
+        }
+
+    } finally {
+
+        if (button) {
+
+            button.disabled =
+                false;
+
+            button.textContent =
+                "Upload & Analyze";
+        }
+    }
+}
+
+
+/* ============================================================
+   REFRESH
+   ============================================================ */
+
+async function refreshDashboard() {
+
+    const refreshButton =
+        $("refreshButton") ||
+        $("refresh");
+
+    if (refreshButton) {
+
+        refreshButton.disabled =
+            true;
+
+        refreshButton.textContent =
+            "Refreshing...";
+    }
+
+
+    try {
+
+        const online =
+            await checkConnection();
+
+        if (!online) {
+
+            throw new Error(
+                "Cannot connect to AegisBurn backend."
+            );
+        }
+
+
+        const components =
+            await loadComponents();
+
+
+        const select =
+            $("componentSelect") ||
+            $("component-selector");
+
+
+        if (
+            components.length &&
+            select
+        ) {
+
+            let componentId =
+                state.selectedComponentId;
+
+
+            if (
+                !componentId ||
+                !findComponent(
+                    componentId
+                )
+            ) {
+
+                componentId =
+                    select.value;
+            }
+
+
+            if (componentId) {
+
+                select.value =
+                    componentId;
+
+                await analyzeComponent(
+                    componentId
+                );
+            }
+        }
+
+
+    } catch (error) {
+
+        console.error(
+            "Dashboard refresh failed:",
+            error
+        );
+
+        showError(
+            error.message
+        );
+
+    } finally {
+
+        if (refreshButton) {
+
+            refreshButton.disabled =
+                false;
+
+            refreshButton.textContent =
+                "Refresh";
+        }
+    }
+}
+
+
+/* ============================================================
+   ERROR
+   ============================================================ */
+
+function showError(
+    message
+) {
+
     const container =
         $("errorMessage") ||
         $("componentStatus");
@@ -1649,112 +3279,22 @@ function showError(message) {
 
 
 /* ============================================================
-   CSV UPLOAD
-   ============================================================ */
-
-async function uploadCSV(file) {
-    if (!file) {
-        return;
-    }
-
-    const uploadStatus =
-        $("uploadStatus") ||
-        $("uploadMessage");
-
-    if (uploadStatus) {
-        uploadStatus.textContent =
-            "Uploading CSV...";
-    }
-
-    try {
-        const formData =
-            new FormData();
-
-        formData.append(
-            "file",
-            file
-        );
-
-        const response =
-            await fetch(
-                `${API_BASE}/upload-csv`,
-                {
-                    method: "POST",
-                    body: formData
-                }
-            );
-
-        const contentType =
-            response.headers.get(
-                "content-type"
-            ) || "";
-
-        let data;
-
-        if (
-            contentType.includes(
-                "application/json"
-            )
-        ) {
-            data =
-                await response.json();
-        } else {
-            data = {
-                detail:
-                    await response.text()
-            };
-        }
-
-        if (!response.ok) {
-            throw new Error(
-                data?.detail ||
-                data?.message ||
-                "CSV upload failed."
-            );
-        }
-
-        if (uploadStatus) {
-            uploadStatus.textContent =
-                data?.message ||
-                "CSV uploaded successfully.";
-        }
-
-        state.selectedComponentId =
-            null;
-
-        await refreshDashboard();
-
-    } catch (error) {
-        console.error(
-            "CSV upload failed:",
-            error
-        );
-
-        if (uploadStatus) {
-            uploadStatus.textContent =
-                `Upload failed: ${error.message}`;
-        }
-
-        showError(
-            error.message
-        );
-    }
-}
-
-
-/* ============================================================
    EVENT LISTENERS
    ============================================================ */
 
 function registerEvents() {
+
     const select =
         $("componentSelect") ||
         $("component-selector");
 
+
     if (select) {
+
         select.addEventListener(
             "change",
-            async (event) => {
+            async event => {
+
                 const componentId =
                     event.target.value;
 
@@ -1762,189 +3302,102 @@ function registerEvents() {
                     return;
                 }
 
-                await loadComponent(
+                await analyzeComponent(
                     componentId
                 );
             }
         );
     }
 
+
+    const analyzeButton =
+        $("analyzeButton");
+
+
+    if (analyzeButton) {
+
+        analyzeButton.addEventListener(
+            "click",
+            async () => {
+
+                const componentId =
+                    state.selectedComponentId ||
+                    select?.value;
+
+                if (!componentId) {
+                    return;
+                }
+
+                await analyzeComponent(
+                    componentId
+                );
+            }
+        );
+    }
+
+
     const refreshButton =
         $("refreshButton") ||
         $("refresh");
 
+
     if (refreshButton) {
+
         refreshButton.addEventListener(
             "click",
             refreshDashboard
         );
     }
 
-    const analyzeButton =
-        $("analyzeButton");
 
-    if (analyzeButton) {
-        analyzeButton.addEventListener(
-            "click",
-            analyzeSelectedComponent
-        );
-    }
-
-    /*
-     * Support multiple possible upload
-     * input IDs so the frontend remains
-     * compatible with the current HTML.
-     */
-
-    const fileInput =
-        $("csvFile") ||
-        $("csvInput") ||
-        $("fileInput") ||
-        $("uploadFile");
-
-    const uploadButton =
-        $("uploadButton") ||
-        $("uploadCsvButton") ||
-        $("uploadCSVButton");
-
-    if (fileInput) {
-        fileInput.addEventListener(
-            "change",
-            () => {
-                const file =
-                    fileInput.files?.[0];
-
-                if (file) {
-                    const fileName =
-                        $("selectedFileName");
-
-                    if (fileName) {
-                        fileName.textContent =
-                            file.name;
-                    }
-                }
-            }
-        );
-    }
-
-    if (
-        uploadButton &&
-        fileInput
-    ) {
-        uploadButton.addEventListener(
-            "click",
-            async () => {
-                const file =
-                    fileInput.files?.[0];
-
-                if (!file) {
-                    showError(
-                        "Please select a CSV file first."
-                    );
-
-                    return;
-                }
-
-                await uploadCSV(
-                    file
-                );
-            }
-        );
-    }
+    registerUploadEvents();
 }
 
 
 /* ============================================================
-   REFRESH DASHBOARD
-   ============================================================ */
-
-async function refreshDashboard() {
-    const refreshButton =
-        $("refreshButton") ||
-        $("refresh");
-
-    if (refreshButton) {
-        refreshButton.disabled =
-            true;
-
-        refreshButton.textContent =
-            "Refreshing...";
-    }
-
-    try {
-        const online =
-            await checkConnection();
-
-        if (!online) {
-            throw new Error(
-                "Cannot connect to AegisBurn backend."
-            );
-        }
-
-        const components =
-            await loadComponents();
-
-        const select =
-            $("componentSelect") ||
-            $("component-selector");
-
-        if (
-            components.length > 0 &&
-            select
-        ) {
-            const componentId =
-                state.selectedComponentId ||
-                select.value;
-
-            if (componentId) {
-                select.value =
-                    componentId;
-
-                await loadComponent(
-                    componentId
-                );
-            }
-        }
-
-    } catch (error) {
-        console.error(
-            "Dashboard refresh failed:",
-            error
-        );
-
-        showError(
-            error.message
-        );
-
-    } finally {
-        if (refreshButton) {
-            refreshButton.disabled =
-                false;
-
-            refreshButton.textContent =
-                "Refresh";
-        }
-    }
-}
-
-
-/* ============================================================
-   APPLICATION STARTUP
+   STARTUP
    ============================================================ */
 
 async function initializeApp() {
+
     console.log(
         "AEGISBURN AI FRONTEND STARTING..."
     );
 
-    setConnectionState(
-        "connecting",
-        "Connecting..."
-    );
+
+    const statusElement =
+        $("systemStatus") ||
+        $("connectionStatus");
+
+
+    const statusDot =
+        $("systemStatusDot");
+
+
+    if (statusElement) {
+
+        statusElement.textContent =
+            "Connecting...";
+
+        statusElement.classList.add(
+            "connecting"
+        );
+    }
+
+
+    if (statusDot) {
+
+        statusDot.classList.add(
+            "connecting"
+        );
+    }
+
 
     registerEvents();
 
+
     await refreshDashboard();
+
 
     console.log(
         "AEGISBURN AI FRONTEND READY"
@@ -1953,17 +3406,20 @@ async function initializeApp() {
 
 
 /* ============================================================
-   START WHEN PAGE IS READY
+   DOM READY
    ============================================================ */
 
 if (
     document.readyState ===
     "loading"
 ) {
+
     document.addEventListener(
         "DOMContentLoaded",
         initializeApp
     );
+
 } else {
+
     initializeApp();
 }

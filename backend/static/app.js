@@ -3095,11 +3095,33 @@ async function uploadCSV() {
 
         if (!response.ok) {
 
-            throw new Error(
-                data?.detail ||
-                data?.message ||
-                "CSV upload failed."
-            );
+            let message =
+                "CSV upload failed.";
+
+            if (typeof data?.detail === "string") {
+
+                message = data.detail;
+
+            } else if (Array.isArray(data?.detail)) {
+
+                message = data.detail
+                    .map((item) =>
+                        item?.msg ||
+                        JSON.stringify(item)
+                    )
+                    .join("; ");
+
+            } else if (data?.detail) {
+
+                message =
+                    JSON.stringify(data.detail);
+
+            } else if (data?.message) {
+
+                message = data.message;
+            }
+
+            throw new Error(message);
         }
 
 

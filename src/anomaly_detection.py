@@ -122,6 +122,33 @@ TRAJECTORY_FEATURES = [
 
 
 # ---------------------------------------------------------------------
+# LOT-RELATIVE FEATURES
+#
+# Static/global comparisons (this component vs. the whole parameter
+# population across every lot) miss the case called out in the SIH
+# problem statement: a lot averaging 10µA where one part reads 45µA
+# is a severe anomaly relative to ITS OWN LOT, even though 45µA may
+# be well under the datasheet's absolute limit and unremarkable
+# compared to the global population.
+#
+# These features express each measurement as a z-score against its
+# own lot's mean/std, learned from training data and looked up by
+# lot_id at inference time (with fallback to the parameter-family
+# baseline for lots that are new/unseen or too small to trust).
+# ---------------------------------------------------------------------
+
+LOT_RELATIVE_FEATURES = [
+    "lot_zscore_0h",
+    "lot_zscore_24h",
+    "lot_zscore_96h",
+]
+
+# A lot needs at least this many rows before its own mean/std are
+# trusted over the parameter-family-wide fallback baseline.
+MIN_LOT_SIZE = 3
+
+
+# ---------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------
 
@@ -743,6 +770,247 @@ def raw_to_anomaly_score(
 # Parameter anomaly detector
 # ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Lot-relative baselines
+# ---------------------------------------------------------------------
+
+@dataclass
+class LotBaselineStore:
+    """
+    Per-lot mean/std baselines for value_0h/24h/96h, learned from
+    training data, with fallback to the parameter-family-wide
+    baseline for lots that are unseen at inference time or too
+    small (fewer than MIN_LOT_SIZE rows) to trust.
+
+    This is what makes the anomaly detector "dynamic": a component
+    is judged against what is typical for its OWN lot, not just
+    against the global population spanning every lot.
+    """
+
+    lot_stats: Dict[str, Dict[str, float]]
+    family_stats: Dict[str, float]
+    min_lot_size: int = MIN_LOT_SIZE
+
+    VALUE_COLUMNS = (
+        "value_0h",
+        "value_24h",
+        "value_96h",
+    )
+
+    @classmethod
+    def fit(
+        cls,
+        df: pd.DataFrame,
+        min_lot_size: int = MIN_LOT_SIZE,
+    ) -> "LotBaselineStore":
+        """
+        Learn family-wide and per-lot mean/std baselines from a
+        training dataframe. df is expected to already be scoped to
+        a single component_type/parameter_name family.
+        """
+
+        family_stats: Dict[str, float] = {}
+
+        for column in cls.VALUE_COLUMNS:
+
+            values = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+            family_stats[f"{column}_mean"] = _safe_float(
+                values.mean(),
+                0.0,
+            )
+
+            std = _safe_float(
+                values.std(),
+                0.0,
+            )
+
+            family_stats[f"{column}_std"] = (
+                std if std > 1e-9 else 1.0
+            )
+
+        lot_stats: Dict[str, Dict[str, float]] = {}
+
+        if "lot_id" in df.columns:
+
+            grouped = df.groupby(
+                df["lot_id"].astype(str)
+            )
+
+            for lot_id, group in grouped:
+
+                if len(group) < min_lot_size:
+                    # Too few rows to trust this lot's own
+                    # statistics; it will fall back to the
+                    # family baseline at lookup time.
+                    continue
+
+                stats: Dict[str, float] = {}
+
+                for column in cls.VALUE_COLUMNS:
+
+                    values = pd.to_numeric(
+                        group[column],
+                        errors="coerce",
+                    )
+
+                    mean = _safe_float(
+                        values.mean(),
+                        family_stats[
+                            f"{column}_mean"
+                        ],
+                    )
+
+                    std = _safe_float(
+                        values.std(),
+                        0.0,
+                    )
+
+                    if std <= 1e-9:
+                        std = family_stats[
+                            f"{column}_std"
+                        ]
+
+                    stats[f"{column}_mean"] = mean
+                    stats[f"{column}_std"] = std
+
+                lot_stats[str(lot_id)] = stats
+
+        return cls(
+            lot_stats=lot_stats,
+            family_stats=family_stats,
+            min_lot_size=min_lot_size,
+        )
+
+    def _baseline_for_lot(
+        self,
+        lot_id: Any,
+    ) -> Dict[str, float]:
+
+        return self.lot_stats.get(
+            str(lot_id),
+            self.family_stats,
+        )
+
+    def add_features(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Return a copy of df with lot_zscore_0h/24h/96h columns
+        added, computed against each row's own lot baseline (or
+        the family fallback baseline when the lot is unseen).
+        """
+
+        result = df.copy()
+
+        if "lot_id" in result.columns:
+            lot_ids = result["lot_id"]
+        else:
+            lot_ids = pd.Series(
+                [""] * len(result),
+                index=result.index,
+            )
+
+        for column in self.VALUE_COLUMNS:
+
+            suffix = column.split("_")[1]
+
+            zscore_column = (
+                f"lot_zscore_{suffix}"
+            )
+
+            values = pd.to_numeric(
+                result[column],
+                errors="coerce",
+            )
+
+            zscores = np.zeros(
+                len(result),
+                dtype=float,
+            )
+
+            for position, (
+                _,
+                lot_id,
+            ) in enumerate(
+                lot_ids.items()
+            ):
+
+                baseline = (
+                    self._baseline_for_lot(
+                        lot_id
+                    )
+                )
+
+                mean = baseline.get(
+                    f"{column}_mean",
+                    0.0,
+                )
+
+                std = baseline.get(
+                    f"{column}_std",
+                    1.0,
+                )
+
+                value = values.iloc[
+                    position
+                ]
+
+                if (
+                    pd.isna(value)
+                    or std <= 1e-9
+                ):
+                    zscores[position] = 0.0
+                else:
+                    zscores[position] = (
+                        (value - mean)
+                        / std
+                    )
+
+            result[zscore_column] = np.clip(
+                zscores,
+                -20.0,
+                20.0,
+            )
+
+        return result
+
+    def to_dict(self) -> Dict[str, Any]:
+
+        return {
+            "lot_stats": self.lot_stats,
+            "family_stats": self.family_stats,
+            "min_lot_size": self.min_lot_size,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+    ) -> "LotBaselineStore":
+
+        return cls(
+            lot_stats=(
+                data.get("lot_stats", {})
+                or {}
+            ),
+            family_stats=(
+                data.get("family_stats", {})
+                or {}
+            ),
+            min_lot_size=int(
+                data.get(
+                    "min_lot_size",
+                    MIN_LOT_SIZE,
+                )
+            ),
+        )
+
+
 class ParameterAnomalyDetector:
     """
     Isolation Forest detector for one component_type /
@@ -786,9 +1054,14 @@ class ParameterAnomalyDetector:
             IsolationForest
         ] = None
 
-        self.feature_columns = list(
-            TRAJECTORY_FEATURES
+        self.feature_columns = (
+            list(TRAJECTORY_FEATURES)
+            + list(LOT_RELATIVE_FEATURES)
         )
+
+        self.lot_baselines: Optional[
+            LotBaselineStore
+        ] = None
 
         self.calibration = (
             ScoreCalibration()
@@ -832,6 +1105,35 @@ class ParameterAnomalyDetector:
         )
 
     # -----------------------------------------------------------------
+    # Lot-relative feature enrichment
+    # -----------------------------------------------------------------
+
+    def _enrich_with_lot_features(
+        self,
+        feature_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Add lot_zscore_0h/24h/96h columns using baselines learned
+        during training. Falls back to zero-filled columns if this
+        detector predates lot baselines (e.g. an older saved model
+        loaded before this feature existed).
+        """
+
+        if self.lot_baselines is None:
+
+            result = feature_df.copy()
+
+            for column in LOT_RELATIVE_FEATURES:
+
+                result[column] = 0.0
+
+            return result
+
+        return self.lot_baselines.add_features(
+            feature_df
+        )
+
+    # -----------------------------------------------------------------
     # Fit
     # -----------------------------------------------------------------
 
@@ -848,12 +1150,29 @@ class ParameterAnomalyDetector:
                 "with an empty dataframe."
             )
 
-        matrix = self._matrix(
+        self.training_rows = len(
             feature_df
         )
 
-        self.training_rows = len(
-            feature_df
+        # -------------------------------------------------------------
+        # Learn per-lot baselines from this family's training data,
+        # then enrich with lot-relative z-score features.
+        # -------------------------------------------------------------
+
+        self.lot_baselines = (
+            LotBaselineStore.fit(
+                feature_df
+            )
+        )
+
+        enriched_df = (
+            self._enrich_with_lot_features(
+                feature_df
+            )
+        )
+
+        matrix = self._matrix(
+            enriched_df
         )
 
         # -------------------------------------------------------------
@@ -861,7 +1180,7 @@ class ParameterAnomalyDetector:
         # -------------------------------------------------------------
 
         core_df = select_unsupervised_core(
-            feature_df
+            enriched_df
         )
 
         core_matrix = self._matrix(
@@ -938,8 +1257,14 @@ class ParameterAnomalyDetector:
                 "Anomaly detector has not been fitted."
             )
 
+        enriched_df = (
+            self._enrich_with_lot_features(
+                feature_df
+            )
+        )
+
         matrix = self._matrix(
-            feature_df
+            enriched_df
         )
 
         return self.model.decision_function(
@@ -962,14 +1287,24 @@ class ParameterAnomalyDetector:
                 "Anomaly detector has not been fitted."
             )
 
-        raw_scores = self.predict_raw(
-            feature_df
+        enriched_df = (
+            self._enrich_with_lot_features(
+                feature_df
+            )
+        )
+
+        matrix = self._matrix(
+            enriched_df
+        )
+
+        raw_scores = (
+            self.model.decision_function(
+                matrix
+            )
         )
 
         flags = self.model.predict(
-            self._matrix(
-                feature_df
-            )
+            matrix
         )
 
         anomaly_indices = np.array(
@@ -1016,7 +1351,9 @@ class ParameterAnomalyDetector:
         Analyze trajectories and return the original feature data
         plus anomaly outputs.
         """
-        result = feature_df.copy()
+        result = self._enrich_with_lot_features(
+            feature_df
+        )
 
         scores = self.predict_score(
             feature_df
@@ -1078,6 +1415,12 @@ class ParameterAnomalyDetector:
             ),
             "fitted": self.fitted,
             "model": self.model,
+            "lot_baselines": (
+                self.lot_baselines.to_dict()
+                if self.lot_baselines
+                is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -1119,7 +1462,8 @@ class ParameterAnomalyDetector:
         detector.feature_columns = list(
             data.get(
                 "feature_columns",
-                TRAJECTORY_FEATURES,
+                list(TRAJECTORY_FEATURES)
+                + list(LOT_RELATIVE_FEATURES),
             )
         )
 
@@ -1148,6 +1492,18 @@ class ParameterAnomalyDetector:
 
         detector.model = data.get(
             "model"
+        )
+
+        lot_baselines_data = data.get(
+            "lot_baselines"
+        )
+
+        detector.lot_baselines = (
+            LotBaselineStore.from_dict(
+                lot_baselines_data
+            )
+            if lot_baselines_data
+            else None
         )
 
         detector.fitted = (

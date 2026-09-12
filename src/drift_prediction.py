@@ -49,9 +49,150 @@ from sklearn.preprocessing import StandardScaler
 PREDICTION_FEATURES: List[str] = [
     "value_0h",
     "value_24h",
+    "value_96h",
+    "drift_0_24",
+    "drift_24_96",
+    "drift_0_96",
+    "relative_drift_0_24",
+    "relative_drift_24_96",
+    "relative_drift_0_96",
+    "slope_early",
+    "slope_mid",
+    "ratio_24_0",
+    "ratio_96_24",
+    "ratio_96_0",
+    "acceleration",
+]
+
+# The three raw measurements a caller must supply. Everything else
+# in PREDICTION_FEATURES is derived from these via
+# build_prediction_features().
+PREDICTION_INPUT_COLUMNS: List[str] = [
+    "value_0h",
+    "value_24h",
+    "value_96h",
 ]
 
 TARGET_COLUMN = "value_168h"
+
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+def build_prediction_features(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute the full prediction feature set from the three early
+    burn-in measurements (value_0h, value_24h, value_96h).
+
+    Captures acceleration between the 24h and 96h readings, which
+    is essential for detecting components that look fine early on
+    but are already ramping toward failure by 96h (e.g. a jump
+    from ~10 at 24h to ~20+ at 96h).
+    """
+
+    missing = [
+        column
+        for column in PREDICTION_INPUT_COLUMNS
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing prediction input columns: {missing}"
+        )
+
+    value_0h = pd.to_numeric(
+        df["value_0h"],
+        errors="coerce",
+    )
+
+    value_24h = pd.to_numeric(
+        df["value_24h"],
+        errors="coerce",
+    )
+
+    value_96h = pd.to_numeric(
+        df["value_96h"],
+        errors="coerce",
+    )
+
+    features = pd.DataFrame(
+        index=df.index
+    )
+
+    features["value_0h"] = value_0h
+    features["value_24h"] = value_24h
+    features["value_96h"] = value_96h
+
+    features["drift_0_24"] = (
+        value_24h - value_0h
+    )
+
+    features["drift_24_96"] = (
+        value_96h - value_24h
+    )
+
+    features["drift_0_96"] = (
+        value_96h - value_0h
+    )
+
+    safe_0h = value_0h.replace(0, np.nan)
+    safe_24h = value_24h.replace(0, np.nan)
+
+    features["relative_drift_0_24"] = (
+        features["drift_0_24"]
+        / safe_0h.abs()
+    )
+
+    features["relative_drift_24_96"] = (
+        features["drift_24_96"]
+        / safe_24h.abs()
+    )
+
+    features["relative_drift_0_96"] = (
+        features["drift_0_96"]
+        / safe_0h.abs()
+    )
+
+    # Average rate of change per hour, each interval.
+    features["slope_early"] = (
+        features["drift_0_24"] / 24.0
+    )
+
+    features["slope_mid"] = (
+        features["drift_24_96"] / 72.0
+    )
+
+    features["ratio_24_0"] = (
+        value_24h / safe_0h
+    )
+
+    features["ratio_96_24"] = (
+        value_96h / safe_24h
+    )
+
+    features["ratio_96_0"] = (
+        value_96h / safe_0h
+    )
+
+    # Acceleration: is the rate of change speeding up between the
+    # early (0-24h) and mid (24-96h) intervals? This is the key
+    # signal for components that look normal at 24h but are
+    # already ramping by 96h.
+    features["acceleration"] = (
+        features["slope_mid"]
+        - features["slope_early"]
+    )
+
+    features = features.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    return features
 
 
 # ============================================================
@@ -111,7 +252,7 @@ class ParameterDriftPredictor:
     ) -> "ParameterDriftPredictor":
 
         required = [
-            *self.feature_names,
+            *PREDICTION_INPUT_COLUMNS,
             TARGET_COLUMN,
         ]
 
@@ -138,9 +279,9 @@ class ParameterDriftPredictor:
 
         train_df = df.copy()
 
-        X = train_df[
-            self.feature_names
-        ].copy()
+        X = build_prediction_features(
+            train_df
+        )
 
         y = train_df[
             TARGET_COLUMN
@@ -339,7 +480,7 @@ class ParameterDriftPredictor:
 
         missing = [
             column
-            for column in self.feature_names
+            for column in PREDICTION_INPUT_COLUMNS
             if column not in df.columns
         ]
 
@@ -348,9 +489,13 @@ class ParameterDriftPredictor:
                 f"Missing prediction features: {missing}"
             )
 
-        X = df[
+        X = build_prediction_features(
+            df
+        )
+
+        X = X[
             self.feature_names
-        ].copy()
+        ]
 
         X = X.replace(
             [np.inf, -np.inf],
@@ -767,7 +912,7 @@ class PredictionModelRegistry:
         required = [
             "component_type",
             "parameter_name",
-            *PREDICTION_FEATURES,
+            *PREDICTION_INPUT_COLUMNS,
             TARGET_COLUMN,
         ]
 

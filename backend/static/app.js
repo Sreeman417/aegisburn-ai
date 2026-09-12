@@ -2160,52 +2160,65 @@ function renderGraph(
     if (!measurements.length) {
 
         if (
-            container.tagName ===
-            "CANVAS"
+            state.chart &&
+            typeof state.chart.destroy ===
+            "function"
         ) {
 
-            const context =
-                container.getContext(
-                    "2d"
-                );
-
-            if (context) {
-                context.clearRect(
-                    0,
-                    0,
-                    container.width,
-                    container.height
-                );
+            try {
+                state.chart.destroy();
+            } catch {
+                // Ignore old chart cleanup errors.
             }
 
-        } else {
-
-            container.innerHTML =
-                `
-                <div class="chart-empty">
-                    No measurement data available.
-                </div>
-                `;
+            state.chart = null;
         }
+
+        container.innerHTML =
+            `
+            <div class="chart-empty">
+                No measurement data available.
+            </div>
+            `;
 
         return;
     }
 
 
     /*
-       If the HTML uses a canvas,
-       use Chart.js when available.
+       container is a <div>. Use Chart.js on an
+       internal canvas when available, otherwise
+       fall back to an inline SVG rendered directly
+       into the div (never into a canvas — canvas
+       does not render its innerHTML).
     */
 
     if (
-        container.tagName ===
-        "CANVAS" &&
         typeof Chart !==
         "undefined"
     ) {
 
+        let canvas =
+            container.querySelector(
+                "canvas"
+            );
+
+        if (!canvas) {
+
+            container.innerHTML = "";
+
+            canvas =
+                document.createElement(
+                    "canvas"
+                );
+
+            container.appendChild(
+                canvas
+            );
+        }
+
         renderChartJS(
-            container,
+            canvas,
             measurements,
             predictedValue,
             data
@@ -2216,8 +2229,24 @@ function renderGraph(
 
 
     /*
-       Otherwise render SVG.
+       Chart.js not available (CDN blocked/offline).
+       Render SVG straight into the div.
     */
+
+    if (
+        state.chart &&
+        typeof state.chart.destroy ===
+        "function"
+    ) {
+
+        try {
+            state.chart.destroy();
+        } catch {
+            // Ignore old chart cleanup errors.
+        }
+
+        state.chart = null;
+    }
 
     renderSVGChart(
         container,
@@ -2365,6 +2394,9 @@ function renderChartJS(
                                     6,
                                     5
                                 ],
+
+                            spanGaps:
+                                true,
 
                             tension:
                                 0.25,

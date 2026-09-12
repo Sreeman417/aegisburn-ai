@@ -923,12 +923,30 @@ class LotBaselineStore:
                 f"lot_zscore_{suffix}"
             )
 
+            mean_column = (
+                f"lot_mean_{suffix}"
+            )
+
+            std_column = (
+                f"lot_std_{suffix}"
+            )
+
             values = pd.to_numeric(
                 result[column],
                 errors="coerce",
             )
 
             zscores = np.zeros(
+                len(result),
+                dtype=float,
+            )
+
+            means = np.zeros(
+                len(result),
+                dtype=float,
+            )
+
+            stds = np.zeros(
                 len(result),
                 dtype=float,
             )
@@ -956,6 +974,9 @@ class LotBaselineStore:
                     1.0,
                 )
 
+                means[position] = mean
+                stds[position] = std
+
                 value = values.iloc[
                     position
                 ]
@@ -970,6 +991,9 @@ class LotBaselineStore:
                         (value - mean)
                         / std
                     )
+
+            result[mean_column] = means
+            result[std_column] = stds
 
             result[zscore_column] = np.clip(
                 zscores,

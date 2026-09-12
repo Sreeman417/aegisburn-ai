@@ -220,6 +220,65 @@ class RiskEngine:
             )
 
         # ----------------------------------------------------------
+        # 1b. LOT-RELATIVE DEVIATION
+        #
+        # A component can look unremarkable against the global
+        # population but be a clear outlier within its own lot
+        # (or vice versa). Surface this explicitly for QA.
+        # ----------------------------------------------------------
+
+        lot_worst_hour = row.get(
+            "lot_worst_hour"
+        )
+
+        lot_worst_zscore = row.get(
+            "lot_worst_zscore"
+        )
+
+        if (
+            lot_worst_hour is not None
+            and lot_worst_zscore is not None
+        ):
+
+            try:
+                lot_worst_zscore = float(
+                    lot_worst_zscore
+                )
+            except (TypeError, ValueError):
+                lot_worst_zscore = 0.0
+
+            if abs(lot_worst_zscore) >= 2.0:
+
+                lot_worst_value = row.get(
+                    "lot_worst_value"
+                )
+
+                lot_worst_mean = row.get(
+                    "lot_worst_mean"
+                )
+
+                direction = (
+                    "above"
+                    if lot_worst_zscore > 0
+                    else "below"
+                )
+
+                reasons.append(
+                    f"At {lot_worst_hour}, this component reads "
+                    f"{lot_worst_value:.3f} vs. its own lot's "
+                    f"average of {lot_worst_mean:.3f} "
+                    f"({abs(lot_worst_zscore):.1f}sigma {direction} "
+                    "lot baseline)."
+                    if lot_worst_value is not None
+                    and lot_worst_mean is not None
+                    else (
+                        f"At {lot_worst_hour}, this component "
+                        f"deviates {abs(lot_worst_zscore):.1f}sigma "
+                        f"{direction} its own lot's typical value."
+                    )
+                )
+
+        # ----------------------------------------------------------
         # 2. EARLY DRIFT
         # ----------------------------------------------------------
 

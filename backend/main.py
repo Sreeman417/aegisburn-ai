@@ -963,76 +963,104 @@ def calculate_anomaly(
 
     try:
 
-        result = ANOMALY_MODELS.predict_component(
-            row
+        # NOTE: ParameterModelRegistry does not have a
+        # predict_component method. analyze_component is the real
+        # API — it runs the trained Isolation Forest model (with
+        # lot-relative features) and returns a plain dict.
+        result = ANOMALY_MODELS.analyze_component(
+            row.to_dict()
+            if hasattr(row, "to_dict")
+            else row
         )
 
-        if isinstance(result, dict):
+        is_anomaly = result.get(
+            "anomaly_flag",
+            0,
+        )
 
-            is_anomaly = result.get(
-                "is_anomaly",
-                result.get(
-                    "anomaly_flag",
-                    False,
-                ),
-            )
+        anomaly_score = result.get(
+            "anomaly_score",
+            0.0,
+        )
 
-            anomaly_score = result.get(
-                "anomaly_score",
-                result.get(
-                    "score",
-                    0.0,
-                ),
-            )
+        anomaly_index = result.get(
+            "anomaly_index",
+            anomaly_score,
+        )
 
-            anomaly_index = result.get(
-                "anomaly_index",
-                anomaly_score,
-            )
-
-            raw_score = result.get(
-                "raw_score",
-                result.get(
-                    "anomaly_raw_score",
-                    anomaly_score,
-                ),
-            )
-
-        else:
-
-            is_anomaly = getattr(
-                result,
-                "is_anomaly",
-                getattr(
-                    result,
-                    "anomaly_flag",
-                    False,
-                ),
-            )
-
-            anomaly_score = getattr(
-                result,
-                "anomaly_score",
-                0.0,
-            )
-
-            anomaly_index = getattr(
-                result,
-                "anomaly_index",
-                anomaly_score,
-            )
-
-            raw_score = getattr(
-                result,
-                "raw_score",
-                getattr(
-                    result,
-                    "anomaly_raw_score",
-                    anomaly_score,
-                ),
-            )
+        raw_score = result.get(
+            "anomaly_raw_score",
+            anomaly_score,
+        )
 
         flag = int(bool(is_anomaly))
+
+        # Find which early measurement deviates most from this
+        # component's own lot baseline — used to build a QA-facing
+        # explanation (e.g. "24h reading is 3.8sigma above this
+        # lot's average").
+        lot_hours = [
+            "0h",
+            "24h",
+            "96h",
+        ]
+
+        worst_hour = None
+        worst_zscore = 0.0
+
+        for hour in lot_hours:
+
+            zscore = float(
+                result.get(
+                    f"lot_zscore_{hour}",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            if abs(zscore) > abs(
+                worst_zscore
+            ):
+                worst_zscore = zscore
+                worst_hour = hour
+
+        lot_context: dict[str, Any] = {
+            "lot_id": result.get(
+                "lot_id",
+                row.get(
+                    "lot_id",
+                    None,
+                ),
+            ),
+            "lot_worst_hour": worst_hour,
+            "lot_worst_zscore": (
+                round(worst_zscore, 3)
+                if worst_hour
+                else None
+            ),
+        }
+
+        if worst_hour is not None:
+
+            lot_context[
+                "lot_worst_value"
+            ] = float(
+                result.get(
+                    f"value_{worst_hour}",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            lot_context[
+                "lot_worst_mean"
+            ] = float(
+                result.get(
+                    f"lot_mean_{worst_hour}",
+                    0.0,
+                )
+                or 0.0
+            )
 
         return {
             "anomaly_flag": flag,
@@ -1050,6 +1078,7 @@ def calculate_anomaly(
             "anomaly_raw_score": float(
                 raw_score
             ),
+            **lot_context,
         }
 
     except Exception as error:
@@ -1696,6 +1725,36 @@ def calculate_risk(
         anomaly_result.get(
             "anomaly_raw_score",
             0.0,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Lot-relative context (for explainability — lets the risk
+    # engine cite "this reading is Nsigma off its own lot's
+    # baseline" instead of only the global population).
+    # -------------------------------------------------------------------------
+
+    risk_row["lot_worst_hour"] = (
+        anomaly_result.get(
+            "lot_worst_hour"
+        )
+    )
+
+    risk_row["lot_worst_zscore"] = (
+        anomaly_result.get(
+            "lot_worst_zscore"
+        )
+    )
+
+    risk_row["lot_worst_value"] = (
+        anomaly_result.get(
+            "lot_worst_value"
+        )
+    )
+
+    risk_row["lot_worst_mean"] = (
+        anomaly_result.get(
+            "lot_worst_mean"
         )
     )
 

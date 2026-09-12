@@ -2284,61 +2284,123 @@ function renderChartJS(
     }
 
 
+    /*
+       Always plot a fixed hour axis (0/24/96/168),
+       not just the hours that have an actual
+       measurement. This matters when value_168h is
+       not yet known (pre-168h screening) — the AI
+       prediction still needs a 168h slot to plot
+       against, even though there is no actual point
+       there yet.
+    */
+
+    const allHours = [
+        0,
+        24,
+        96,
+        168
+    ];
+
     const labels =
-        measurements.map(
-            point =>
-                `${point.hour}h`
+        allHours.map(
+            hour =>
+                `${hour}h`
         );
 
+    const valueByHour = {};
+
+    measurements.forEach(
+        point => {
+            valueByHour[
+                point.hour
+            ] = point.value;
+        }
+    );
+
     const measuredData =
-        measurements.map(
-            point =>
-                point.value
+        allHours.map(
+            hour =>
+                valueByHour[hour] ??
+                null
         );
 
 
     const predictedData =
-        measurements.map(
+        allHours.map(
             () => null
         );
 
 
     /*
-       Draw prediction from 24h to 168h.
+       Bridge the dashed prediction line from the
+       last known actual measurement through to the
+       168h prediction, regardless of whether an
+       actual 168h value exists.
     */
 
     if (
         predictedValue !== null
     ) {
 
-        const index24 =
-            measurements.findIndex(
-                point =>
-                    point.hour === 24
-            );
-
         const index168 =
-            measurements.findIndex(
-                point =>
-                    point.hour === 168
-            );
+            allHours.indexOf(168);
+
+        const hasValue =
+            hour =>
+                valueByHour[hour] !==
+                undefined &&
+                valueByHour[hour] !==
+                null;
+
+        /*
+           Bridge from 24h when available (matches
+           the SVG renderer's behavior), otherwise
+           fall back to the earliest available early
+           point. Never bridge from the 168h slot
+           itself — even when an actual 168h value
+           exists, the prediction should still show
+           the forecast trajectory from earlier data,
+           not connect a point to itself.
+        */
+
+        let bridgeIndex = -1;
+
+        const bridgePreference = [
+            24,
+            0,
+            96
+        ];
+
+        for (
+            const hour of bridgePreference
+        ) {
+
+            if (hasValue(hour)) {
+
+                bridgeIndex =
+                    allHours.indexOf(
+                        hour
+                    );
+
+                break;
+            }
+        }
 
         if (
-            index24 >= 0 &&
-            index168 >= 0
+            bridgeIndex >= 0 &&
+            bridgeIndex !== index168
         ) {
 
             predictedData[
-                index24
+                bridgeIndex
             ] =
-                measurements[
-                    index24
-                ].value;
+                measuredData[
+                    bridgeIndex
+                ];
 
             predictedData[
                 index168
-            ] =
-                predictedValue;
+            ] = predictedValue;
         }
     }
 

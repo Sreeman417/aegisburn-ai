@@ -124,18 +124,22 @@ class RiskEngine:
             )
         )
 
-        drift_96_168 = self._float(
-            row.get(
-                "drift_96_168",
-                value_168h - value_96h
-            )
+        # NOTE: These are ALWAYS computed from predicted_168h, NOT
+        # read from the row even if a drift_96_168/drift_0_168
+        # column already exists there. main.py's create_features()
+        # precomputes these columns from the ACTUAL value_168h when
+        # it is present (e.g. an uploaded CSV that includes real
+        # 168h data), which would leak ground truth straight into
+        # risk_score via total_relative_drift below. This is a
+        # predictive risk score computed before 168h is known, so
+        # the real future value must never reach it — only the
+        # model's own prediction may.
+        drift_96_168 = (
+            predicted_168h - value_96h
         )
 
-        drift_0_168 = self._float(
-            row.get(
-                "drift_0_168",
-                value_168h - value_0h
-            )
+        drift_0_168 = (
+            predicted_168h - value_0h
         )
 
         early_slope = self._float(
@@ -163,11 +167,21 @@ class RiskEngine:
         limit_utilization = 0.0
 
         if engineering_limit > 0:
+
+            # NOTE: value_168h is intentionally EXCLUDED here.
+            # This is a predictive risk score computed BEFORE
+            # 168h is known — including the actual future value
+            # would leak ground truth into the risk decision and
+            # defeat the entire point of early screening. Only
+            # values available during real early-stage screening
+            # (0h/24h/96h) plus the model's own prediction are
+            # used, even if an uploaded CSV happens to include an
+            # actual value_168h (e.g. for retrospective/evaluation
+            # datasets).
             observed_max = max(
                 value_0h,
                 value_24h,
                 value_96h,
-                value_168h,
                 predicted_168h
             )
 

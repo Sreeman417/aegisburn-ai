@@ -1,70 +1,35 @@
-from src.preprocessing import (
-    load_and_validate_data,
-    preprocess_data,
-)
+"""
+AegisBurn AI — Anomaly Model Training Entrypoint
+==================================================
 
-from src.features import create_early_features
+ALWAYS retrain the anomaly detector by running THIS script:
 
-from src.anomaly_detection import DynamicAnomalyDetector
+    python train_anomaly.py
 
+Do NOT run `python src/anomaly_detection.py` directly.
 
-def main():
-    print("Loading dataset...")
+WHY THIS MATTERS:
 
-    df = load_and_validate_data(
-        "data/raw/component_data.csv"
-    )
+When a .py file is executed directly (`python src/anomaly_detection.py`),
+Python sets that module's __name__ to "__main__". Any class defined in
+that file -- including ParameterAnomalyDetector -- then gets pickled
+with its module recorded as "__main__" instead of "src.anomaly_detection".
 
-    df = preprocess_data(df)
+That pickle can then ONLY be unpickled by a process whose own __main__
+namespace happens to also define ParameterAnomalyDetector. Loading it
+from anywhere else (the FastAPI backend, evaluate_anomaly.py, a fresh
+shell, etc.) fails with:
 
-    print("Creating early-stage features...")
+    AttributeError: Can't get attribute 'ParameterAnomalyDetector'
+    on <module '__main__' from '...'>
 
-    df = create_early_features(df)
+This script avoids the problem entirely: it IMPORTS anomaly_detection
+as a normal module (never executes it directly), so its classes keep
+their correct, portable module path (src.anomaly_detection) in the
+saved pickle, loadable from any script.
+"""
 
-    print("Training anomaly detector...")
-
-    model = DynamicAnomalyDetector(
-        contamination=0.20,
-        n_estimators=300,
-        random_state=42,
-    )
-
-    model.fit(df)
-
-    metrics = model.evaluate(df)
-
-    print("\nMODULE A — DYNAMIC ANOMALY DETECTION")
-    print("=" * 60)
-
-    print(
-        f"Precision:           {metrics['precision']:.4f}"
-    )
-
-    print(
-        f"Recall:              {metrics['recall']:.4f}"
-    )
-
-    print(
-        f"F1:                  {metrics['f1']:.4f}"
-    )
-
-    print(
-        f"False Positive Rate: {metrics['false_positive_rate']:.4f}"
-    )
-
-    print(
-        f"False Negative Rate: {metrics['false_negative_rate']:.4f}"
-    )
-
-    print("\nSaving model...")
-
-    model.save(
-        "models/anomaly_model.joblib"
-    )
-
-    print(
-        "Saved: models/anomaly_model.joblib"
-    )
+from src.anomaly_detection import main
 
 
 if __name__ == "__main__":

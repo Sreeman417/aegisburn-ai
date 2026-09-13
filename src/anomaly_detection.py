@@ -606,6 +606,14 @@ class ScoreCalibration:
     high_percentile: float = 0.0
     threshold_raw: float = 0.0
 
+    # Binary anomaly_flag is decided by anomaly_index >= this
+    # value (0-100 scale), NOT by Isolation Forest's own internal
+    # contamination-driven cutoff. This makes the flagging
+    # threshold something that can be calibrated against a
+    # labeled evaluation set to hit a target recall / false-
+    # negative rate, instead of being an opaque fixed guess.
+    flagging_threshold: float = 50.0
+
     def to_dict(self) -> Dict[str, float]:
         return {
             "median": float(self.median),
@@ -618,6 +626,9 @@ class ScoreCalibration:
             ),
             "threshold_raw": float(
                 self.threshold_raw
+            ),
+            "flagging_threshold": float(
+                self.flagging_threshold
             ),
         }
 
@@ -649,6 +660,16 @@ class ScoreCalibration:
             threshold_raw=_safe_float(
                 data.get("threshold_raw"),
                 0.0,
+            ),
+            flagging_threshold=_clip_float(
+                _safe_float(
+                    data.get(
+                        "flagging_threshold"
+                    ),
+                    50.0,
+                ),
+                0.0,
+                100.0,
             ),
         )
 
@@ -1261,6 +1282,19 @@ class ParameterAnomalyDetector:
             )
         )
 
+        # Default the flagging threshold to whatever anomaly_index
+        # corresponds to Isolation Forest's own natural boundary,
+        # so behavior is unchanged until it is deliberately
+        # recalibrated against a labeled evaluation set (see
+        # evaluate_anomaly.py) to target a specific recall / false
+        # negative rate.
+        self.calibration.flagging_threshold = (
+            raw_to_anomaly_score(
+                threshold_raw,
+                self.calibration,
+            )
+        )
+
         self.fitted = True
 
         return self
@@ -1327,10 +1361,6 @@ class ParameterAnomalyDetector:
             )
         )
 
-        flags = self.model.predict(
-            matrix
-        )
-
         anomaly_indices = np.array(
             [
                 raw_to_anomaly_score(
@@ -1342,11 +1372,19 @@ class ParameterAnomalyDetector:
             dtype=float,
         )
 
+        # Binary flag is driven by the calibratable
+        # flagging_threshold on the continuous 0-100 index, not
+        # by Isolation Forest's own fixed internal cutoff. This
+        # is what makes the false-negative rate tunable against a
+        # labeled evaluation set (see evaluate_anomaly.py).
+        flags = (
+            anomaly_indices
+            >= self.calibration.flagging_threshold
+        ).astype(int)
+
         return pd.DataFrame(
             {
-                "anomaly_flag": (
-                    flags == -1
-                ).astype(int),
+                "anomaly_flag": flags,
 
                 "anomaly_score": (
                     anomaly_indices

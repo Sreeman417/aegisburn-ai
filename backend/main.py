@@ -2144,8 +2144,28 @@ def analyze_component(
     # 7. FINAL RESULT
     # -------------------------------------------------------------------------
 
+    # These are derived directly from the actual value_168h (only
+    # present when a dataset happens to include real 168h data,
+    # e.g. an uploaded CSV). They are never used in any anomaly or
+    # risk decision, but leaving them in the API response would
+    # still expose future-derived information in what is meant to
+    # be a pre-168h predictive screening payload. Strip them here.
+    leaked_future_fields = (
+        "drift_96_168",
+        "drift_0_168",
+        "ratio_168_96",
+        "ratio_168_0",
+        "slope_late",
+        "late_growth_ratio",
+    )
+
+    row_dict = row.to_dict()
+
+    for field in leaked_future_fields:
+        row_dict.pop(field, None)
+
     result = {
-        **row.to_dict(),
+        **row_dict,
 
         **anomaly_result,
 

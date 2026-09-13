@@ -47,6 +47,15 @@ function setHTML(id, value) {
 }
 
 function numberValue(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return null;
+    }
+
     const number = Number(value);
 
     return Number.isFinite(number)
@@ -2366,9 +2375,9 @@ function renderChartJS(
         let bridgeIndex = -1;
 
         const bridgePreference = [
+            96,
             24,
-            0,
-            96
+            0
         ];
 
         for (
@@ -2674,11 +2683,16 @@ function renderSVGChart(
         predictedValue !== null
     ) {
 
-        const predictedStart =
-            measurements.find(
+        const earlyMeasurements =
+            measurements.filter(
                 point =>
-                    point.hour === 24
-            ) ||
+                    point.hour !== 168
+            );
+
+        const predictedStart =
+            earlyMeasurements[
+                earlyMeasurements.length - 1
+            ] ||
             measurements[0];
 
 

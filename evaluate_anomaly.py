@@ -506,6 +506,73 @@ def run_evaluation(
     )
 
     # ------------------------------------------------------------
+    # Breakdown by defect_type. LATENT_DEFECT is the core
+    # motivating case in the problem statement -- a component
+    # that passes absolute limits but drifts subtly over time --
+    # so its recall is reported explicitly, not just folded into
+    # the overall "defective" recall above.
+    # ------------------------------------------------------------
+
+    if "defect_type" in eval_df.columns:
+
+        print()
+        print("=" * 78)
+        print("RECALL BY DEFECT TYPE (all families combined)")
+        print("=" * 78)
+
+        analyzed_all = registry.analyze(
+            model_input
+        )
+
+        analyzed_all["defect_type"] = eval_df[
+            "defect_type"
+        ].to_numpy()
+
+        for defect_type in [
+            "GRADUAL_DRIFT",
+            "LATENT_DEFECT",
+            "SUDDEN_ANOMALY",
+        ]:
+
+            subset = analyzed_all[
+                analyzed_all["defect_type"]
+                == defect_type
+            ]
+
+            if len(subset) == 0:
+                continue
+
+            caught = int(
+                subset["anomaly_flag"].sum()
+            )
+
+            total = len(subset)
+
+            recall = caught / total
+
+            missed = total - caught
+
+            print(
+                f"{defect_type}: {caught}/{total} caught "
+                f"({recall:.1%})  -- {missed} missed"
+            )
+
+        normal_subset = analyzed_all[
+            analyzed_all["defect_type"] == "NORMAL"
+        ]
+
+        if len(normal_subset) > 0:
+
+            false_alarm_rate = normal_subset[
+                "anomaly_flag"
+            ].mean()
+
+            print(
+                f"\nFalse alarm rate on truly NORMAL parts: "
+                f"{false_alarm_rate:.1%}"
+            )
+
+    # ------------------------------------------------------------
     # Apply calibrated thresholds and re-save, if requested.
     # ------------------------------------------------------------
 

@@ -75,6 +75,94 @@ PREDICTION_INPUT_COLUMNS: List[str] = [
 
 TARGET_COLUMN = "value_168h"
 
+# ---------------------------------------------------------------
+# EARLY-ONLY (0h/24h) prediction path
+#
+# The literal problem statement specifies a model that "takes
+# Value_0h and Value_24h as inputs" -- for components still mid
+# burn-in where value_96h genuinely isn't measured yet. This is
+# used automatically whenever value_96h is missing for a given
+# component; PREDICTION_FEATURES (0h/24h/96h) is used whenever
+# 96h is available, since it is meaningfully more accurate.
+# ---------------------------------------------------------------
+
+EARLY_INPUT_COLUMNS: List[str] = [
+    "value_0h",
+    "value_24h",
+]
+
+EARLY_FEATURES: List[str] = [
+    "value_0h",
+    "value_24h",
+    "drift_0_24",
+    "relative_drift_0_24",
+    "slope_early",
+    "ratio_24_0",
+]
+
+
+def build_early_prediction_features(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute the 0h/24h-only feature set, used when value_96h is
+    not yet available for a component.
+    """
+
+    missing = [
+        column
+        for column in EARLY_INPUT_COLUMNS
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing early prediction input columns: {missing}"
+        )
+
+    value_0h = pd.to_numeric(
+        df["value_0h"],
+        errors="coerce",
+    )
+
+    value_24h = pd.to_numeric(
+        df["value_24h"],
+        errors="coerce",
+    )
+
+    features = pd.DataFrame(
+        index=df.index
+    )
+
+    features["value_0h"] = value_0h
+    features["value_24h"] = value_24h
+
+    features["drift_0_24"] = (
+        value_24h - value_0h
+    )
+
+    safe_0h = value_0h.replace(0, np.nan)
+
+    features["relative_drift_0_24"] = (
+        features["drift_0_24"]
+        / safe_0h.abs()
+    )
+
+    features["slope_early"] = (
+        features["drift_0_24"] / 24.0
+    )
+
+    features["ratio_24_0"] = (
+        value_24h / safe_0h
+    )
+
+    features = features.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    return features
+
 
 # ============================================================
 # FEATURE ENGINEERING
@@ -205,6 +293,125 @@ class PredictionResult:
     component_type: str
     parameter_name: str
     model_name: str
+    input_stage: str = "0h_24h_96h"
+
+
+# ============================================================
+# CANDIDATE MODEL SELECTION (shared by both the full 0h/24h/96h
+# model and the early-only 0h/24h model)
+# ============================================================
+
+def _select_best_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    random_state: int,
+):
+    """
+    Fit LinearRegression / RandomForest / GradientBoosting on an
+    80/20 split, pick the lowest-MAE model, then refit that model
+    on all available data. Returns (model, name, mae, rmse, r2)
+    where the metrics are from the held-out 20% split.
+    """
+
+    if len(X) < 20:
+        raise ValueError(
+            "Not enough valid rows for prediction model. "
+            f"Found {len(X)}, need at least 20."
+        )
+
+    models = {
+        "LinearRegression": Pipeline(
+            steps=[
+                (
+                    "scaler",
+                    StandardScaler(),
+                ),
+                (
+                    "model",
+                    LinearRegression(),
+                ),
+            ]
+        ),
+
+        "RandomForestRegressor": RandomForestRegressor(
+            n_estimators=300,
+            random_state=random_state,
+            n_jobs=-1,
+            min_samples_leaf=2,
+        ),
+
+        "GradientBoostingRegressor": GradientBoostingRegressor(
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=random_state,
+        ),
+    }
+
+    best_model = None
+    best_model_name = None
+    best_mae = float("inf")
+    best_rmse = None
+    best_r2 = None
+
+    split_index = int(len(X) * 0.80)
+
+    if split_index < 10:
+        split_index = len(X) - 10
+
+    X_train = X.iloc[:split_index]
+    y_train = y.iloc[:split_index]
+    X_test = X.iloc[split_index:]
+    y_test = y.iloc[split_index:]
+
+    for name, model in models.items():
+
+        model.fit(X_train, y_train)
+
+        predictions = model.predict(X_test)
+
+        mae = mean_absolute_error(
+            y_test,
+            predictions,
+        )
+
+        rmse = float(
+            np.sqrt(
+                mean_squared_error(
+                    y_test,
+                    predictions,
+                )
+            )
+        )
+
+        r2 = r2_score(
+            y_test,
+            predictions,
+        )
+
+        if mae < best_mae:
+
+            best_mae = mae
+            best_rmse = rmse
+            best_r2 = r2
+            best_model = model
+            best_model_name = name
+
+    if best_model is None:
+        raise RuntimeError(
+            "Unable to select a prediction model."
+        )
+
+    # Refit the selected model on all available data.
+    best_model.fit(X, y)
+
+    return (
+        best_model,
+        best_model_name,
+        float(best_mae),
+        float(best_rmse),
+        float(best_r2),
+    )
 
 
 # ============================================================
@@ -239,6 +446,28 @@ class ParameterDriftPredictor:
         self.rmse: Optional[float] = None
 
         self.r2: Optional[float] = None
+
+        # -------------------------------------------------------
+        # Early-only (0h/24h) model -- used automatically when
+        # value_96h is not available for a component, matching
+        # the literal problem statement's two-input spec.
+        # -------------------------------------------------------
+
+        self.early_model: Optional[Pipeline] = None
+
+        self.early_model_name: Optional[str] = None
+
+        self.early_feature_names = (
+            EARLY_FEATURES.copy()
+        )
+
+        self.early_training_count: int = 0
+
+        self.early_mae: Optional[float] = None
+
+        self.early_rmse: Optional[float] = None
+
+        self.early_r2: Optional[float] = None
 
     # ========================================================
     # FIT
@@ -279,185 +508,90 @@ class ParameterDriftPredictor:
 
         train_df = df.copy()
 
-        X = build_prediction_features(
+        # -----------------------------------------------------
+        # Full model: 0h/24h/96h -> 168h
+        # -----------------------------------------------------
+
+        X_full = build_prediction_features(
             train_df
         )
 
-        y = train_df[
-            TARGET_COLUMN
-        ].copy()
+        y_full = pd.to_numeric(
+            train_df[TARGET_COLUMN],
+            errors="coerce",
+        )
 
-        X = X.replace(
+        X_full = X_full.replace(
             [np.inf, -np.inf],
             np.nan,
         )
 
-        y = pd.to_numeric(
-            y,
+        valid_full = (
+            X_full.notna().all(axis=1)
+            & y_full.notna()
+        )
+
+        X_full = X_full.loc[valid_full]
+        y_full = y_full.loc[valid_full]
+
+        (
+            self.model,
+            self.model_name,
+            self.mae,
+            self.rmse,
+            self.r2,
+        ) = _select_best_model(
+            X_full,
+            y_full,
+            self.random_state,
+        )
+
+        self.training_count = len(X_full)
+
+        # -----------------------------------------------------
+        # Early-only model: 0h/24h -> 168h
+        #
+        # Used automatically whenever value_96h is not yet
+        # available for a component, matching the literal
+        # problem-statement spec of a two-input model.
+        # -----------------------------------------------------
+
+        X_early = build_early_prediction_features(
+            train_df
+        )
+
+        y_early = pd.to_numeric(
+            train_df[TARGET_COLUMN],
             errors="coerce",
         )
 
-        valid = (
-            X.notna().all(axis=1)
-            & y.notna()
+        X_early = X_early.replace(
+            [np.inf, -np.inf],
+            np.nan,
         )
 
-        X = X.loc[valid]
-        y = y.loc[valid]
-
-        if len(X) < 20:
-            raise ValueError(
-                "Not enough valid rows for prediction model. "
-                f"Found {len(X)}, need at least 20."
-            )
-
-        # ----------------------------------------------------
-        # Candidate models
-        # ----------------------------------------------------
-
-        models = {
-            "LinearRegression": Pipeline(
-                steps=[
-                    (
-                        "scaler",
-                        StandardScaler(),
-                    ),
-                    (
-                        "model",
-                        LinearRegression(),
-                    ),
-                ]
-            ),
-
-            "RandomForestRegressor": RandomForestRegressor(
-                n_estimators=300,
-                random_state=self.random_state,
-                n_jobs=-1,
-                min_samples_leaf=2,
-            ),
-
-            "GradientBoostingRegressor": GradientBoostingRegressor(
-                n_estimators=250,
-                learning_rate=0.05,
-                max_depth=3,
-                random_state=self.random_state,
-            ),
-        }
-
-        best_model = None
-        best_model_name = None
-        best_mae = float("inf")
-
-        best_rmse = None
-        best_r2 = None
-
-        # ----------------------------------------------------
-        # Evaluate candidates
-        # ----------------------------------------------------
-        #
-        # For this prototype, use an internal chronological-style
-        # holdout rather than evaluating on exactly the same rows
-        # used for fitting.
-        #
-        # This is still synthetic-data evaluation and should later
-        # be replaced with a proper lot-aware train/test split.
-        # ----------------------------------------------------
-
-        split_index = int(
-            len(X) * 0.80
+        valid_early = (
+            X_early.notna().all(axis=1)
+            & y_early.notna()
         )
 
-        if split_index < 10:
-            split_index = len(X) - 10
+        X_early = X_early.loc[valid_early]
+        y_early = y_early.loc[valid_early]
 
-        X_train = X.iloc[
-            :split_index
-        ]
-
-        y_train = y.iloc[
-            :split_index
-        ]
-
-        X_test = X.iloc[
-            split_index:
-        ]
-
-        y_test = y.iloc[
-            split_index:
-        ]
-
-        for name, model in models.items():
-
-            model.fit(
-                X_train,
-                y_train,
-            )
-
-            predictions = model.predict(
-                X_test
-            )
-
-            mae = mean_absolute_error(
-                y_test,
-                predictions,
-            )
-
-            rmse = float(
-                np.sqrt(
-                    mean_squared_error(
-                        y_test,
-                        predictions,
-                    )
-                )
-            )
-
-            r2 = r2_score(
-                y_test,
-                predictions,
-            )
-
-            if mae < best_mae:
-
-                best_mae = mae
-
-                best_rmse = rmse
-
-                best_r2 = r2
-
-                best_model = model
-
-                best_model_name = name
-
-        if best_model is None:
-            raise RuntimeError(
-                "Unable to select a prediction model."
-            )
-
-        # ----------------------------------------------------
-        # Refit selected model on all available data
-        # ----------------------------------------------------
-
-        best_model.fit(
-            X,
-            y,
+        (
+            self.early_model,
+            self.early_model_name,
+            self.early_mae,
+            self.early_rmse,
+            self.early_r2,
+        ) = _select_best_model(
+            X_early,
+            y_early,
+            self.random_state,
         )
 
-        self.model = best_model
-
-        self.model_name = best_model_name
-
-        self.training_count = len(X)
-
-        self.mae = float(
-            best_mae
-        )
-
-        self.rmse = float(
-            best_rmse
-        )
-
-        self.r2 = float(
-            best_r2
+        self.early_training_count = len(
+            X_early
         )
 
         return self
@@ -472,6 +606,34 @@ class ParameterDriftPredictor:
             raise RuntimeError(
                 "Prediction model is not fitted."
             )
+
+        if self.early_model is None:
+            raise RuntimeError(
+                "Early-stage (0h/24h) prediction model is not "
+                "fitted."
+            )
+
+    def _has_96h(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.Series:
+        """
+        Per-row boolean: is value_96h actually available for this
+        component? False for components still mid burn-in that
+        only have 0h/24h so far.
+        """
+
+        if "value_96h" not in df.columns:
+
+            return pd.Series(
+                False,
+                index=df.index,
+            )
+
+        return pd.to_numeric(
+            df["value_96h"],
+            errors="coerce",
+        ).notna()
 
     def _prepare_features(
         self,
@@ -524,6 +686,57 @@ class ParameterDriftPredictor:
 
         return X
 
+    def _prepare_early_features(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        missing = [
+            column
+            for column in EARLY_INPUT_COLUMNS
+            if column not in df.columns
+        ]
+
+        if missing:
+            raise ValueError(
+                f"Missing early prediction features: {missing}"
+            )
+
+        X = build_early_prediction_features(
+            df
+        )
+
+        X = X[
+            self.early_feature_names
+        ]
+
+        X = X.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        for column in self.early_feature_names:
+
+            if X[column].isna().any():
+
+                median_value = X[
+                    column
+                ].median()
+
+                if pd.isna(
+                    median_value
+                ):
+
+                    median_value = 0.0
+
+                X[column] = X[
+                    column
+                ].fillna(
+                    median_value
+                )
+
+        return X
+
     # ========================================================
     # PREDICT
     # ========================================================
@@ -535,18 +748,52 @@ class ParameterDriftPredictor:
 
         self._check_fitted()
 
-        X = self._prepare_features(
-            df
-        )
+        has_96h = self._has_96h(df)
 
-        predictions = self.model.predict(
-            X
-        )
-
-        return np.asarray(
-            predictions,
+        predictions = np.full(
+            len(df),
+            np.nan,
             dtype=float,
         )
+
+        # Rows with a real value_96h use the more accurate full
+        # (0h/24h/96h) model.
+        if has_96h.any():
+
+            full_rows = df.loc[has_96h]
+
+            X_full = self._prepare_features(
+                full_rows
+            )
+
+            predictions[
+                has_96h.to_numpy()
+            ] = self.model.predict(
+                X_full
+            )
+
+        # Rows without value_96h (still mid burn-in) use the
+        # early-only (0h/24h) model -- the literal problem
+        # statement's two-input spec.
+        missing_96h = ~has_96h
+
+        if missing_96h.any():
+
+            early_rows = df.loc[
+                missing_96h
+            ]
+
+            X_early = self._prepare_early_features(
+                early_rows
+            )
+
+            predictions[
+                missing_96h.to_numpy()
+            ] = self.early_model.predict(
+                X_early
+            )
+
+        return predictions
 
     # ========================================================
     # ONE COMPONENT
@@ -594,11 +841,33 @@ class ParameterDriftPredictor:
                 "parameter_name is required."
             )
 
+        record_df = pd.DataFrame(
+            [record]
+        )
+
+        has_96h = self._has_96h(
+            record_df
+        ).iloc[0]
+
         prediction = self.predict(
-            pd.DataFrame(
-                [record]
-            )
+            record_df
         )[0]
+
+        if has_96h:
+
+            input_stage = "0h_24h_96h"
+            model_name = (
+                self.model_name
+                or "unknown"
+            )
+
+        else:
+
+            input_stage = "0h_24h"
+            model_name = (
+                self.early_model_name
+                or "unknown"
+            )
 
         return PredictionResult(
             predicted_168h=float(
@@ -606,10 +875,8 @@ class ParameterDriftPredictor:
             ),
             component_type=component_type,
             parameter_name=parameter_name,
-            model_name=(
-                self.model_name
-                or "unknown"
-            ),
+            model_name=model_name,
+            input_stage=input_stage,
         )
 
     # ========================================================
@@ -658,6 +925,27 @@ class ParameterDriftPredictor:
 
             "random_state":
                 self.random_state,
+
+            "early_model":
+                self.early_model,
+
+            "early_model_name":
+                self.early_model_name,
+
+            "early_feature_names":
+                self.early_feature_names,
+
+            "early_training_count":
+                self.early_training_count,
+
+            "early_mae":
+                self.early_mae,
+
+            "early_rmse":
+                self.early_rmse,
+
+            "early_r2":
+                self.early_r2,
         }
 
         joblib.dump(
@@ -730,6 +1018,36 @@ class ParameterDriftPredictor:
 
         predictor.r2 = payload.get(
             "r2"
+        )
+
+        predictor.early_model = payload.get(
+            "early_model"
+        )
+
+        predictor.early_model_name = payload.get(
+            "early_model_name"
+        )
+
+        predictor.early_feature_names = payload.get(
+            "early_feature_names",
+            EARLY_FEATURES.copy(),
+        )
+
+        predictor.early_training_count = payload.get(
+            "early_training_count",
+            0,
+        )
+
+        predictor.early_mae = payload.get(
+            "early_mae"
+        )
+
+        predictor.early_rmse = payload.get(
+            "early_rmse"
+        )
+
+        predictor.early_r2 = payload.get(
+            "early_r2"
         )
 
         return predictor

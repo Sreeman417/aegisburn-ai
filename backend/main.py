@@ -1078,6 +1078,10 @@ def calculate_anomaly(
             "anomaly_raw_score": float(
                 raw_score
             ),
+            "input_stage": result.get(
+                "input_stage",
+                "0h_24h_96h",
+            ),
             **lot_context,
         }
 
@@ -2029,6 +2033,14 @@ def analyze_component(
         row
     )
 
+    prediction_input_stage = (
+        "0h_24h_96h"
+        if pd.notna(
+            row.get("value_96h")
+        )
+        else "0h_24h"
+    )
+
     value_24h = float(
         row.get(
             "value_24h",
@@ -2177,6 +2189,9 @@ def analyze_component(
         "predicted_slope": float(
             predicted_slope
         ),
+
+        "prediction_input_stage":
+            prediction_input_stage,
 
         # Risk
         "risk_score": float(
@@ -2968,3 +2983,18 @@ if __name__ == "__main__":
         port=8001,
         reload=True,
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    

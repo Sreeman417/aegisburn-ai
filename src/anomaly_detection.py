@@ -149,6 +149,35 @@ MIN_LOT_SIZE = 3
 
 
 # ---------------------------------------------------------------------
+# EARLY-ONLY (0h/24h) anomaly features
+#
+# Used automatically for components that are still mid burn-in and
+# only have value_0h/value_24h measured so far. This is the 96h-
+# independent subset of TRAJECTORY_FEATURES/LOT_RELATIVE_FEATURES
+# above. Without this, a missing value_96h would leave every
+# 96h-derived feature as NaN, which previously got silently
+# zero-filled -- making an ordinary in-progress component look like
+# an extreme statistical outlier to Isolation Forest for no real
+# reason.
+# ---------------------------------------------------------------------
+
+EARLY_TRAJECTORY_FEATURES = [
+    "value_0h",
+    "value_24h",
+
+    "drift_0_24",
+    "relative_drift_0_24",
+    "slope_early",
+    "ratio_24_0",
+]
+
+EARLY_LOT_RELATIVE_FEATURES = [
+    "lot_zscore_0h",
+    "lot_zscore_24h",
+]
+
+
+# ---------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------
 
@@ -368,6 +397,14 @@ def create_anomaly_features(
     )
 
     eps = 1e-9
+
+    # Capture this BEFORE the fillna(0.0) cleanup below erases the
+    # NaN signal -- value_96h is itself one of TRAJECTORY_FEATURES,
+    # so it gets zero-filled along with the derived columns. This
+    # marker is what lets downstream code detect "still mid
+    # burn-in, no 96h yet" instead of misreading a filled 0.0 as
+    # if it were a real measurement.
+    result["_has_96h"] = v96.notna()
 
     # -------------------------------------------------------------
     # Absolute drift
@@ -1117,6 +1154,28 @@ class ParameterAnomalyDetector:
 
         self.fitted = False
 
+        # -------------------------------------------------------
+        # Early-only (0h/24h) model -- used automatically when
+        # value_96h is not yet available for a component (still
+        # mid burn-in).
+        # -------------------------------------------------------
+
+        self.early_feature_columns = (
+            list(EARLY_TRAJECTORY_FEATURES)
+            + list(EARLY_LOT_RELATIVE_FEATURES)
+        )
+
+        self.early_model: Optional[
+            IsolationForest
+        ] = None
+
+        self.early_calibration = (
+            ScoreCalibration()
+        )
+
+        self.early_training_rows = 0
+        self.early_core_training_rows = 0
+
     # -----------------------------------------------------------------
     # Matrix creation
     # -----------------------------------------------------------------
@@ -1126,10 +1185,35 @@ class ParameterAnomalyDetector:
         feature_df: pd.DataFrame,
     ) -> np.ndarray:
         """
-        Convert feature dataframe into model matrix.
+        Convert feature dataframe into model matrix (full
+        0h/24h/96h feature set).
         """
+        return self._matrix_for_columns(
+            feature_df,
+            self.feature_columns,
+        )
+
+    def _early_matrix(
+        self,
+        feature_df: pd.DataFrame,
+    ) -> np.ndarray:
+        """
+        Convert feature dataframe into model matrix (early-only
+        0h/24h feature set).
+        """
+        return self._matrix_for_columns(
+            feature_df,
+            self.early_feature_columns,
+        )
+
+    def _matrix_for_columns(
+        self,
+        feature_df: pd.DataFrame,
+        columns: list,
+    ) -> np.ndarray:
+
         matrix = feature_df[
-            self.feature_columns
+            columns
         ].copy()
 
         matrix = matrix.replace(
@@ -1177,6 +1261,39 @@ class ParameterAnomalyDetector:
         return self.lot_baselines.add_features(
             feature_df
         )
+
+    def _has_96h(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.Series:
+        """
+        Per-row boolean: is value_96h actually available for this
+        component? False for components still mid burn-in.
+
+        Prefers the _has_96h marker set by create_anomaly_features
+        (captured before value_96h itself gets zero-filled as part
+        of TRAJECTORY_FEATURES cleanup). Falls back to checking
+        value_96h directly for dataframes that didn't go through
+        that function.
+        """
+
+        if "_has_96h" in df.columns:
+
+            return df["_has_96h"].astype(
+                bool
+            )
+
+        if "value_96h" not in df.columns:
+
+            return pd.Series(
+                False,
+                index=df.index,
+            )
+
+        return pd.to_numeric(
+            df["value_96h"],
+            errors="coerce",
+        ).notna()
 
     # -----------------------------------------------------------------
     # Fit
@@ -1295,6 +1412,69 @@ class ParameterAnomalyDetector:
             )
         )
 
+        # -------------------------------------------------------------
+        # Early-only (0h/24h) model -- used automatically for
+        # components still mid burn-in that don't have value_96h
+        # yet. Trained on the same stable core rows, but only the
+        # 96h-independent features, so it never sees NaN/zero-
+        # filled 96h-derived columns.
+        # -------------------------------------------------------------
+
+        self.early_training_rows = len(
+            feature_df
+        )
+
+        self.early_core_training_rows = len(
+            core_df
+        )
+
+        early_core_matrix = self._early_matrix(
+            core_df
+        )
+
+        self.early_model = IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=self.random_state,
+            n_jobs=-1,
+            bootstrap=False,
+        )
+
+        self.early_model.fit(
+            early_core_matrix
+        )
+
+        early_core_raw_scores = (
+            self.early_model.decision_function(
+                early_core_matrix
+            )
+        )
+
+        early_threshold_raw = (
+            _safe_float(
+                getattr(
+                    self.early_model,
+                    "offset_",
+                    0.0,
+                ),
+                0.0,
+            )
+        )
+
+        self.early_calibration = (
+            fit_score_calibration(
+                early_core_raw_scores,
+                early_threshold_raw,
+            )
+        )
+
+        self.early_calibration.flagging_threshold = (
+            raw_to_anomaly_score(
+                early_threshold_raw,
+                self.early_calibration,
+            )
+        )
+
         self.fitted = True
 
         return self
@@ -1338,7 +1518,11 @@ class ParameterAnomalyDetector:
         feature_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Return continuous anomaly scores.
+        Return continuous anomaly scores. Rows with a real
+        value_96h use the full (0h/24h/96h) model; rows still mid
+        burn-in (no value_96h yet) automatically use the
+        early-only (0h/24h) model instead of zero-filling missing
+        96h-derived features into the full model.
         """
         if not self.fitted or self.model is None:
             raise RuntimeError(
@@ -1351,35 +1535,96 @@ class ParameterAnomalyDetector:
             )
         )
 
-        matrix = self._matrix(
-            enriched_df
+        has_96h = self._has_96h(
+            feature_df
         )
 
-        raw_scores = (
-            self.model.decision_function(
-                matrix
-            )
-        )
-
-        anomaly_indices = np.array(
-            [
-                raw_to_anomaly_score(
-                    raw,
-                    self.calibration,
-                )
-                for raw in raw_scores
-            ],
+        anomaly_indices = np.full(
+            len(feature_df),
+            0.0,
             dtype=float,
         )
 
-        # Binary flag is driven by the calibratable
-        # flagging_threshold on the continuous 0-100 index, not
-        # by Isolation Forest's own fixed internal cutoff. This
-        # is what makes the false-negative rate tunable against a
-        # labeled evaluation set (see evaluate_anomaly.py).
+        raw_scores = np.full(
+            len(feature_df),
+            0.0,
+            dtype=float,
+        )
+
+        if has_96h.any():
+
+            full_rows = enriched_df.loc[
+                has_96h
+            ]
+
+            full_matrix = self._matrix(
+                full_rows
+            )
+
+            full_raw = (
+                self.model.decision_function(
+                    full_matrix
+                )
+            )
+
+            full_index = np.array(
+                [
+                    raw_to_anomaly_score(
+                        raw,
+                        self.calibration,
+                    )
+                    for raw in full_raw
+                ],
+                dtype=float,
+            )
+
+            mask = has_96h.to_numpy()
+            raw_scores[mask] = full_raw
+            anomaly_indices[mask] = full_index
+
+        missing_96h = ~has_96h
+
+        if missing_96h.any():
+
+            early_rows = enriched_df.loc[
+                missing_96h
+            ]
+
+            early_matrix = self._early_matrix(
+                early_rows
+            )
+
+            early_raw = (
+                self.early_model.decision_function(
+                    early_matrix
+                )
+            )
+
+            early_index = np.array(
+                [
+                    raw_to_anomaly_score(
+                        raw,
+                        self.early_calibration,
+                    )
+                    for raw in early_raw
+                ],
+                dtype=float,
+            )
+
+            mask = missing_96h.to_numpy()
+            raw_scores[mask] = early_raw
+            anomaly_indices[mask] = early_index
+
+        # Each row is flagged against ITS OWN model's calibrated
+        # threshold (full or early), not a single shared value.
+        thresholds = np.where(
+            has_96h.to_numpy(),
+            self.calibration.flagging_threshold,
+            self.early_calibration.flagging_threshold,
+        )
+
         flags = (
-            anomaly_indices
-            >= self.calibration.flagging_threshold
+            anomaly_indices >= thresholds
         ).astype(int)
 
         return pd.DataFrame(
@@ -1396,6 +1641,12 @@ class ParameterAnomalyDetector:
 
                 "anomaly_raw_score": (
                     raw_scores
+                ),
+
+                "input_stage": np.where(
+                    has_96h.to_numpy(),
+                    "0h_24h_96h",
+                    "0h_24h",
                 ),
             },
             index=feature_df.index,

@@ -944,6 +944,10 @@ function renderAnalysis(
         data
     );
 
+    renderBehaviorPattern(
+        data
+    );
+
     renderPrediction(
         data
     );
@@ -1768,6 +1772,121 @@ function renderEngineeringLimit(
                 utilization,
                 2
             )}% of engineering limit`
+        );
+    }
+}
+
+
+/* ============================================================
+   BEHAVIOR PATTERN CLASSIFICATION
+   ============================================================ */
+
+function renderBehaviorPattern(
+    data
+) {
+
+    const pattern =
+        String(
+            data.behavior_pattern ||
+            "NORMAL"
+        ).toUpperCase();
+
+    const label =
+        data.behavior_pattern_label ||
+        "Normal";
+
+    const explanation =
+        data.behavior_pattern_explanation ||
+        "";
+
+    const badge =
+        $("behaviorPatternBadge");
+
+    if (badge) {
+
+        badge.textContent =
+            pattern.replace(
+                /_/g,
+                " "
+            );
+
+        badge.classList.remove(
+            "badge-normal",
+            "badge-anomaly",
+            "badge-review",
+            "badge-latent",
+            "badge-sudden",
+            "badge-gradual",
+            "badge-watch"
+        );
+
+        if (pattern === "LATENT_DEFECT") {
+
+            badge.classList.add(
+                "badge-latent"
+            );
+
+        } else if (pattern === "SUDDEN_ANOMALY") {
+
+            badge.classList.add(
+                "badge-sudden"
+            );
+
+        } else if (pattern === "GRADUAL_DRIFT") {
+
+            badge.classList.add(
+                "badge-gradual"
+            );
+
+        } else if (pattern === "WATCH") {
+
+            badge.classList.add(
+                "badge-watch"
+            );
+
+        } else {
+
+            badge.classList.add(
+                "badge-normal"
+            );
+        }
+    }
+
+    setText(
+        "behaviorPatternLabel",
+        label
+    );
+
+    setText(
+        "behaviorPatternExplanation",
+        explanation ||
+        "No additional detail available."
+    );
+
+    const labelElement =
+        $("behaviorPatternLabel");
+
+    if (labelElement) {
+
+        labelElement.classList.remove(
+            "pattern-normal",
+            "pattern-latent",
+            "pattern-sudden",
+            "pattern-gradual",
+            "pattern-watch"
+        );
+
+        const patternClassMap = {
+            LATENT_DEFECT: "pattern-latent",
+            SUDDEN_ANOMALY: "pattern-sudden",
+            GRADUAL_DRIFT: "pattern-gradual",
+            WATCH: "pattern-watch",
+            NORMAL: "pattern-normal"
+        };
+
+        labelElement.classList.add(
+            patternClassMap[pattern] ||
+            "pattern-normal"
         );
     }
 }

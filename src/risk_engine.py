@@ -549,6 +549,108 @@ class RiskEngine:
         )
 
         # ==========================================================
+        # BEHAVIOR PATTERN CLASSIFICATION
+        #
+        # Names WHICH failure pattern the trajectory shape
+        # resembles -- not just a risk number. This is purely
+        # shape-based from features already computed above; no
+        # ground-truth labels are used. Directly targets the
+        # explainability requirement: a QA inspector sees "this
+        # looks like a Latent Defect" instead of just "risk: 62".
+        # ==========================================================
+
+        early_index = self._clamp(
+            early_relative_drift
+        )
+
+        future_index = self._clamp(
+            predicted_relative_change
+        )
+
+        # Did the value spike early then partially recover, rather
+        # than keep climbing? A real recovery-after-spike shape,
+        # not just "some drift happened between 24h and 96h".
+        is_spike_recovery = (
+            drift_0_24 > 0
+            and drift_24_96 < 0
+            and abs(drift_24_96)
+            >= abs(drift_0_24) * 0.3
+        )
+
+        if not anomaly_flag:
+
+            if future_index >= 25:
+
+                behavior_pattern = "WATCH"
+
+                behavior_pattern_label = (
+                    "Potential Latent Defect (Early Warning)"
+                )
+
+                behavior_pattern_explanation = (
+                    "Not yet flagged as anomalous, but the "
+                    "predicted 168h trajectory shows meaningful "
+                    "drift relative to the engineering limit. "
+                    "Worth monitoring -- this is exactly the "
+                    "early-warning case a static pass/fail limit "
+                    "would miss entirely."
+                )
+
+            else:
+
+                behavior_pattern = "NORMAL"
+
+                behavior_pattern_label = "Normal"
+
+                behavior_pattern_explanation = (
+                    "Early and predicted future drift are both "
+                    "within the expected range for this "
+                    "component family."
+                )
+
+        elif is_spike_recovery:
+
+            behavior_pattern = "SUDDEN_ANOMALY"
+
+            behavior_pattern_label = "Sudden Anomaly (Transient Spike)"
+
+            behavior_pattern_explanation = (
+                "A sharp early spike followed by partial recovery "
+                "-- the value moved a lot in one interval, then "
+                "pulled back. This transient shape is "
+                "characteristic of a sudden anomaly rather than "
+                "steady degradation."
+            )
+
+        elif early_index < 15 and future_index >= 40:
+
+            behavior_pattern = "LATENT_DEFECT"
+
+            behavior_pattern_label = "Latent Defect"
+
+            behavior_pattern_explanation = (
+                "This is the defining latent-defect signature: "
+                "early behavior (0h-24h) looked unremarkable -- "
+                "it would have passed a static early-screening "
+                "limit -- but the predicted trajectory shows "
+                "substantial drift developing later. A dynamic, "
+                "trajectory-aware model is what catches this; a "
+                "fixed pass/fail threshold at 24h would not."
+            )
+
+        else:
+
+            behavior_pattern = "GRADUAL_DRIFT"
+
+            behavior_pattern_label = "Gradual Drift"
+
+            behavior_pattern_explanation = (
+                "Drift is elevated and escalating steadily across "
+                "the burn-in period, rather than appearing as a "
+                "single spike or staying hidden until late."
+            )
+
+        # ==========================================================
         # RETURN
         # ==========================================================
 
@@ -593,16 +695,12 @@ class RiskEngine:
             ),
 
             "early_drift_index": round(
-                self._clamp(
-                    early_relative_drift
-                ),
+                early_index,
                 2
             ),
 
             "future_drift_index": round(
-                self._clamp(
-                    predicted_relative_change
-                ),
+                future_index,
                 2
             ),
 
@@ -615,6 +713,13 @@ class RiskEngine:
                 engineering_limit,
                 4
             ),
+
+            "behavior_pattern": behavior_pattern,
+
+            "behavior_pattern_label": behavior_pattern_label,
+
+            "behavior_pattern_explanation":
+                behavior_pattern_explanation,
 
             "risk_reasons": reasons,
 

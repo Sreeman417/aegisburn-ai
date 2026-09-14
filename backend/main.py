@@ -2218,6 +2218,28 @@ def analyze_component(
             )
         ),
 
+        # Behavior pattern classification
+        "behavior_pattern": str(
+            risk_result.get(
+                "behavior_pattern",
+                "NORMAL",
+            )
+        ),
+
+        "behavior_pattern_label": str(
+            risk_result.get(
+                "behavior_pattern_label",
+                "Normal",
+            )
+        ),
+
+        "behavior_pattern_explanation": str(
+            risk_result.get(
+                "behavior_pattern_explanation",
+                "",
+            )
+        ),
+
         # Drift
         "early_drift_index": float(
             risk_result.get(
@@ -2983,18 +3005,3 @@ if __name__ == "__main__":
         port=8001,
         reload=True,
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
